@@ -401,7 +401,7 @@ type Engine struct {
 	bannedWords []string
 	bannedMu    sync.RWMutex
 
-	disabledCmds map[string]bool
+	disabledCmds map[string]bool  // command names, matched exactly as typed
 	adminFrom    string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
 	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
@@ -1198,25 +1198,63 @@ func (e *Engine) ClearAliases() {
 	e.aliases = make(map[string]string)
 }
 
-// resolveDisabledCmds resolves a list of command names (including "*" wildcard)
-// to a set of canonical command IDs.
+// resolveDisabledCmds normalizes a list of command names (including the "*"
+// wildcard) into the set of names that must stop working.
+//
+// Names are matched exactly rather than resolved to a canonical command id, so
+// each entry disables only the name it names: ["ps"] leaves the same command
+// reachable as "/btw", and ["sh"] leaves "/shell" alone. Disabling a command
+// outright means listing its aliases too, which disabledCmdLeftovers reports at
+// startup so a partial entry is never silent.
 func resolveDisabledCmds(cmds []string) map[string]bool {
 	m := make(map[string]bool, len(cmds))
 	for _, c := range cmds {
-		c = strings.ToLower(strings.TrimPrefix(c, "/"))
+		c = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(c, "/")))
 		if c == "*" {
 			for _, bc := range builtinCommands {
+				for _, n := range bc.names {
+					m[n] = true
+				}
 				m[bc.id] = true
 			}
 			return m
 		}
-		if id := matchPrefix(c, builtinCommands); id != "" {
-			m[id] = true
-		} else {
+		if c != "" {
 			m[c] = true
 		}
 	}
 	return m
+}
+
+// disabledCmdLeftovers reports, for every built-in command that had some but
+// not all of its names disabled, the names that still work. Exact matching
+// makes a partial entry easy to write by accident — disabling "shell" while
+// "/sh" stays live — so callers log this instead of leaving it to be
+// discovered in production.
+func disabledCmdLeftovers(disabled map[string]bool) map[string][]string {
+	if len(disabled) == 0 {
+		return nil
+	}
+	var out map[string][]string
+	for _, c := range builtinCommands {
+		var live []string
+		hit := false
+		for _, n := range c.names {
+			if disabled[n] {
+				hit = true
+			} else {
+				live = append(live, n)
+			}
+		}
+		if !hit || len(live) == 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[string][]string)
+		}
+		out[c.id] = live
+	}
+	return out
 }
 
 // GetDisabledCommands returns the list of disabled command IDs for this project.
@@ -1231,11 +1269,65 @@ func (e *Engine) GetDisabledCommands() []string {
 	return out
 }
 
-// SetDisabledCommands sets the list of command IDs that are disabled for this project.
+// SetDisabledCommands sets the command names that are disabled for this project.
 func (e *Engine) SetDisabledCommands(cmds []string) {
 	e.userRolesMu.Lock()
-	defer e.userRolesMu.Unlock()
-	e.disabledCmds = resolveDisabledCmds(cmds)
+	resolved := resolveDisabledCmds(cmds)
+	e.disabledCmds = resolved
+	e.userRolesMu.Unlock()
+
+	for id, live := range disabledCmdLeftovers(resolved) {
+		slog.Info("disabled_commands: command still reachable under other names",
+			"project", e.name, "command", id, "still_usable", live)
+	}
+}
+
+// commandCandidates returns builtinCommands with the disabled names removed, so
+// a disabled name stops resolving through prefix matching too: with "ps" gone,
+// neither "/ps" nor "/p" reaches the command, while "/btw" still does. Entries
+// left without any usable name are dropped.
+func commandCandidates(disabled map[string]bool) []struct {
+	names []string
+	id    string
+} {
+	if len(disabled) == 0 {
+		return builtinCommands
+	}
+	out := make([]struct {
+		names []string
+		id    string
+	}, 0, len(builtinCommands))
+	for _, c := range builtinCommands {
+		names := make([]string, 0, len(c.names))
+		for _, n := range c.names {
+			if !disabled[n] {
+				names = append(names, n)
+			}
+		}
+		if len(names) == 0 {
+			continue
+		}
+		out = append(out, struct {
+			names []string
+			id    string
+		}{names: names, id: c.id})
+	}
+	return out
+}
+
+// menuNameFor picks the name a command is advertised under. The canonical id is
+// preferred; when it is disabled the first surviving alias takes its place so
+// the command keeps a menu entry. Returns "" when every name is disabled.
+func menuNameFor(names []string, id string, disabled map[string]bool) string {
+	if !disabled[id] {
+		return id
+	}
+	for _, n := range names {
+		if !disabled[n] {
+			return n
+		}
+	}
+	return ""
 }
 
 // SetUserRoles configures per-user role-based policies. Pass nil to disable.
@@ -6943,8 +7035,6 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
 	args := parts[1:]
 
-	cmdID := matchPrefix(cmd, builtinCommands)
-
 	// Resolve effective disabled commands: role-based if available, else project-level
 	e.userRolesMu.RLock()
 	disabledCmds := e.disabledCmds
@@ -6955,6 +7045,16 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 			disabledCmds = role.DisabledCmds
 		}
 	}
+
+	if disabledCmds[cmd] {
+		slog.Info("audit: command_blocked",
+			"user_id", msg.UserID, "platform", msg.Platform,
+			"project", e.name, "command", cmd, "reason", "disabled")
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandDisabled), "/"+cmd))
+		return true
+	}
+
+	cmdID := matchPrefix(cmd, commandCandidates(disabledCmds))
 
 	if cmdID != "" && disabledCmds[cmdID] {
 		slog.Info("audit: command_blocked",
@@ -9939,21 +10039,16 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
 		if len(c.names) == 0 {
 			continue
 		}
-		// Use id as primary
-		primaryName := c.id
-		if seenCmds[primaryName] {
+		// Use id as primary, falling back to a surviving alias
+		primaryName := menuNameFor(c.names, c.id, disabledCmds)
+		if primaryName == "" || seenCmds[primaryName] {
 			continue
 		}
 		seenCmds[primaryName] = true
 
-		// Skip disabled commands
-		if disabledCmds[c.id] {
-			continue
-		}
-
 		commands = append(commands, BotCommandInfo{
 			Command:     primaryName,
-			Description: e.i18n.T(MsgKey(primaryName)),
+			Description: e.i18n.T(MsgKey(c.id)),
 		})
 	}
 

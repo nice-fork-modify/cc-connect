@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -2619,6 +2620,168 @@ func TestResolveDisabledCmds_Empty(t *testing.T) {
 	m2 := resolveDisabledCmds([]string{})
 	if len(m2) != 0 {
 		t.Errorf("empty input should produce empty map, got %d entries", len(m2))
+	}
+}
+
+func TestResolveDisabledCmds_MatchesNamesExactly(t *testing.T) {
+	m := resolveDisabledCmds([]string{"ps", "/Sh", " exec ", ""})
+	for _, want := range []string{"ps", "sh", "exec"} {
+		if !m[want] {
+			t.Errorf("%q should be disabled", want)
+		}
+	}
+	// Names are never resolved to a canonical id, so sibling aliases survive.
+	if m["shell"] {
+		t.Error("disabling \"sh\" must not disable \"shell\"")
+	}
+	if m["btw"] {
+		t.Error("disabling \"ps\" must not disable its alias \"btw\"")
+	}
+	if len(m) != 3 {
+		t.Errorf("blank entry should be dropped, got %d entries", len(m))
+	}
+}
+
+func TestResolveDisabledCmds_WildcardCoversAliases(t *testing.T) {
+	m := resolveDisabledCmds([]string{"*"})
+	for _, bc := range builtinCommands {
+		for _, n := range bc.names {
+			if !m[n] {
+				t.Errorf("wildcard should disable the name %q", n)
+			}
+		}
+	}
+}
+
+func TestDisabledCmdLeftovers(t *testing.T) {
+	got := disabledCmdLeftovers(resolveDisabledCmds([]string{"shell", "ps", "help"}))
+
+	if !reflect.DeepEqual(got["shell"], []string{"sh", "exec", "run"}) {
+		t.Errorf("shell leftovers = %v, want [sh exec run]", got["shell"])
+	}
+	if !reflect.DeepEqual(got["ps"], []string{"btw"}) {
+		t.Errorf("ps leftovers = %v, want [btw]", got["ps"])
+	}
+	// help has no aliases, so nothing is left over to report.
+	if _, ok := got["help"]; ok {
+		t.Error("help should not be reported as partially disabled")
+	}
+	// Untouched commands are not reported either.
+	if _, ok := got["list"]; ok {
+		t.Error("list should not be reported")
+	}
+}
+
+func TestDisabledCmdLeftovers_FullyDisabledIsSilent(t *testing.T) {
+	got := disabledCmdLeftovers(resolveDisabledCmds([]string{"shell", "sh", "exec", "run"}))
+	if _, ok := got["shell"]; ok {
+		t.Error("a fully disabled command has no leftovers to report")
+	}
+	if got := disabledCmdLeftovers(nil); got != nil {
+		t.Errorf("empty input = %v, want nil", got)
+	}
+}
+
+func TestCommandCandidates_DropsDisabledNamesOnly(t *testing.T) {
+	cands := commandCandidates(resolveDisabledCmds([]string{"ps", "sh", "exec", "run"}))
+
+	byID := make(map[string][]string, len(cands))
+	for _, c := range cands {
+		byID[c.id] = c.names
+	}
+	if got := byID["ps"]; !reflect.DeepEqual(got, []string{"btw"}) {
+		t.Errorf("ps names = %v, want [btw]", got)
+	}
+	if got := byID["shell"]; !reflect.DeepEqual(got, []string{"shell"}) {
+		t.Errorf("shell names = %v, want [shell]", got)
+	}
+
+	// A disabled name must not resolve, not even through prefix matching.
+	if id := matchPrefix("ps", cands); id != "" {
+		t.Errorf("matchPrefix(ps) = %q, want empty", id)
+	}
+	if id := matchPrefix("btw", cands); id != "ps" {
+		t.Errorf("matchPrefix(btw) = %q, want ps", id)
+	}
+	if id := matchPrefix("shell", cands); id != "shell" {
+		t.Errorf("matchPrefix(shell) = %q, want shell", id)
+	}
+	if id := matchPrefix("sh", cands); id == "shell" {
+		t.Error("matchPrefix(sh) still reaches shell after the name was disabled")
+	}
+}
+
+func TestCommandCandidates_EmptyReturnsBuiltins(t *testing.T) {
+	if got := commandCandidates(nil); len(got) != len(builtinCommands) {
+		t.Errorf("got %d candidates, want %d", len(got), len(builtinCommands))
+	}
+}
+
+func TestCommandCandidates_DropsFullyDisabledCommand(t *testing.T) {
+	cands := commandCandidates(resolveDisabledCmds([]string{"ps", "btw"}))
+	for _, c := range cands {
+		if c.id == "ps" {
+			t.Fatal("ps should be dropped once every name is disabled")
+		}
+	}
+}
+
+func TestMenuNameFor(t *testing.T) {
+	cases := []struct {
+		name     string
+		names    []string
+		id       string
+		disabled []string
+		want     string
+	}{
+		{"id survives", []string{"ps", "btw"}, "ps", nil, "ps"},
+		{"falls back to alias", []string{"ps", "btw"}, "ps", []string{"ps"}, "btw"},
+		{"all disabled", []string{"ps", "btw"}, "ps", []string{"ps", "btw"}, ""},
+		{"unrelated alias disabled", []string{"shell", "sh", "exec", "run"}, "shell", []string{"sh"}, "shell"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := menuNameFor(tc.names, tc.id, resolveDisabledCmds(tc.disabled))
+			if got != tc.want {
+				t.Errorf("menuNameFor() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEngine_DisabledNameMenuUsesSurvivingName(t *testing.T) {
+	e := newTestEngine()
+	e.SetDisabledCommands([]string{"ps", "name"})
+
+	menu := make(map[string]string)
+	for _, c := range e.GetAllCommands() {
+		menu[c.Command] = c.Description
+	}
+	if _, ok := menu["ps"]; ok {
+		t.Error("/ps should not be advertised")
+	}
+	if _, ok := menu["btw"]; !ok {
+		t.Error("/btw should take over the menu entry")
+	}
+	if _, ok := menu["rename"]; !ok {
+		t.Error("/rename should take over the menu entry")
+	}
+	// The description still comes from the canonical id's translation.
+	if menu["btw"] != e.i18n.T(MsgKey("ps")) {
+		t.Errorf("btw description = %q, want the ps translation", menu["btw"])
+	}
+}
+
+func TestEngine_DisabledNameLeavesOtherNamesUsable(t *testing.T) {
+	e := newTestEngine()
+	e.SetDisabledCommands([]string{"sh", "exec", "run"})
+
+	if got := e.GetDisabledCommands(); !reflect.DeepEqual(got, []string{"exec", "run", "sh"}) {
+		t.Errorf("GetDisabledCommands() = %v, want [exec run sh]", got)
+	}
+	cands := commandCandidates(e.disabledCmds)
+	if id := matchPrefix("shell", cands); id != "shell" {
+		t.Errorf("/shell should still work, matchPrefix = %q", id)
 	}
 }
 

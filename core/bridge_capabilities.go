@@ -63,15 +63,16 @@ func (e *Engine) GetBridgePublishedCommands() []bridgePublishedCommand {
 	var commands []bridgePublishedCommand
 
 	for _, c := range builtinCommands {
-		if len(c.names) == 0 || disabledCmds[c.id] {
+		if len(c.names) == 0 {
 			continue
 		}
-		if seen[c.id] {
+		name := menuNameFor(c.names, c.id, disabledCmds)
+		if name == "" || seen[name] {
 			continue
 		}
-		seen[c.id] = true
+		seen[name] = true
 		commands = append(commands, bridgePublishedCommand{
-			Name:              c.id,
+			Name:              name,
 			Description:       e.i18n.T(MsgKey(c.id)),
 			Source:            bridgeCommandSourceBuiltin,
 			RequiresWorkspace: false,

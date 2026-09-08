@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -1697,6 +1698,19 @@ func TestLoad_DefaultsAutoCompressDisabled(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesDisabledCommands(t *testing.T) {
+	configPath := writeConfigFixture(t, projectWithDisabledCommandsFixture)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	want := []string{"restart", "ps", "sh"}
+	if got := cfg.Projects[0].DisabledCommands; !reflect.DeepEqual(got, want) {
+		t.Fatalf("disabled_commands = %v, want %v", got, want)
+	}
+}
+
 func TestLoad_ParsesResetOnIdleMins(t *testing.T) {
 	configPath := writeConfigFixture(t, projectWithResetOnIdleFixture)
 
@@ -2130,6 +2144,24 @@ allow_from = "ou_existing_owner"
 const projectWithoutFeishuFixture = `
 [[projects]]
 name = "beta"
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "/tmp/beta"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+bot_token = "token_xxx"
+`
+
+const projectWithDisabledCommandsFixture = `
+[[projects]]
+name = "beta"
+disabled_commands = ["restart", "ps", "sh"]
 
 [projects.agent]
 type = "codex"

@@ -774,6 +774,14 @@ name = "my-backend"
 # filter_external_sessions：为 true 时，/list /switch /delete 仅显示由 cc-connect 创建的会话，
 # 隐藏在相同 work_dir 下通过直接 CLI 创建的会话。默认 false = 显示 agent 的全部会话。
 #
+# inject_sender: when true, every message forwarded to the agent is prefixed with
+# a line identifying the sender, so the agent can tell users apart in a group chat:
+#   [cc-connect sender_id=ou_abc123 sender_name="Alice" platform=feishu chat_id=oc_xyz]
+# sender_name is omitted when the platform reports no display name. Default false.
+# inject_sender = false
+# inject_sender：为 true 时，转发给 agent 的每条消息前会加一行发送者标识，
+# 让 agent 在群聊里区分不同用户；平台没有提供昵称时不带 sender_name。默认 false。
+#
 # shell = "/bin/fish"                        # Per-project shell override / 项目级 shell 覆盖
 # shell_profile = "source ~/.config/fish/config.fish"  # Per-project shell profile / 项目级 shell profile
 #

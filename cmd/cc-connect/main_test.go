@@ -435,3 +435,75 @@ func TestRunTopLevelCommandUnknown(t *testing.T) {
 		t.Fatal("runTopLevelCommand() handled unknown command")
 	}
 }
+
+func TestResolveConfigPath(t *testing.T) {
+	t.Run("explicit flag wins", func(t *testing.T) {
+		if got := resolveConfigPath("/tmp/custom.toml"); got != "/tmp/custom.toml" {
+			t.Errorf("got %q, want /tmp/custom.toml", got)
+		}
+	})
+
+	t.Run("working directory config.toml", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "config.toml"))
+		chdir(t, dir)
+		if got := resolveConfigPath(""); got != "config.toml" {
+			t.Errorf("got %q, want config.toml", got)
+		}
+	})
+
+	t.Run("working directory .cc-connect", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, ".cc-connect", "config.toml"))
+		chdir(t, dir)
+		want := filepath.Join(".cc-connect", "config.toml")
+		if got := resolveConfigPath(""); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("falls back to home when nothing found", func(t *testing.T) {
+		chdir(t, t.TempDir())
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Skip("no home dir")
+		}
+		want := filepath.Join(home, ".cc-connect", "config.toml")
+		if got := resolveConfigPath(""); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+}
+
+func TestConfigSearchDirsIsWorkingDirThenExecutableDir(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("no executable path")
+	}
+	want := []string{".", filepath.Dir(exe)}
+	if got := configSearchDirs(); !reflect.DeepEqual(got, want) {
+		t.Errorf("configSearchDirs() = %v, want %v", got, want)
+	}
+}
+
+func writeFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("# test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(prev) })
+}

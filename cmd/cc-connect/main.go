@@ -1550,18 +1550,45 @@ func resolveClaudeProjectDir(workDir string) string {
 }
 
 // resolveConfigPath determines which config file to use.
-// Priority: explicit flag → ./config.toml → ~/.cc-connect/config.toml
+// Priority: explicit flag → working directory → executable directory →
+// ~/.cc-connect/config.toml
+//
+// Probing the executable's directory lets a deployment keep the binary, its
+// config and its data side by side instead of depending on the invoking
+// user's home directory. Note that os.Executable resolves symlinks, so a
+// symlinked launcher is probed at its target's directory, not its own.
 func resolveConfigPath(explicit string) string {
 	if explicit != "" {
 		return explicit
 	}
-	if _, err := os.Stat("config.toml"); err == nil {
-		return "config.toml"
+	for _, dir := range configSearchDirs() {
+		if p := filepath.Join(dir, "config.toml"); fileExists(p) {
+			return p
+		}
+		if p := filepath.Join(dir, ".cc-connect", "config.toml"); fileExists(p) {
+			return p
+		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(home, ".cc-connect", "config.toml")
 	}
 	return "config.toml"
+}
+
+// configSearchDirs lists the directories probed for a config file, in order:
+// the working directory, then the executable's own directory.
+func configSearchDirs() []string {
+	dirs := []string{"."}
+	exe, err := os.Executable()
+	if err != nil {
+		return dirs
+	}
+	return append(dirs, filepath.Dir(exe))
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func bootstrapConfig(path string) error {

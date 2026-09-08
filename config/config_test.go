@@ -3506,3 +3506,64 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 		t.Errorf("proj2 provider_refs: want [], got %v", refs2)
 	}
 }
+
+func TestDefaultDataDir(t *testing.T) {
+	home, homeErr := os.UserHomeDir()
+
+	tests := []struct {
+		name       string
+		configPath string
+		want       string
+		skipNoHome bool
+	}{
+		{
+			name:       "config inside .cc-connect keeps data alongside it",
+			configPath: "/opt/deploy/.cc-connect/config.toml",
+			want:       "/opt/deploy/.cc-connect",
+		},
+		{
+			// Agents are spawned with work_dir as their cwd, so a relative
+			// data dir would resolve there instead of next to the config.
+			name:       "relative config path is made absolute",
+			configPath: ".cc-connect/config.toml",
+			want:       filepath.Join(mustGetwd(t), ".cc-connect"),
+		},
+		{
+			name:       "home layout resolves to the same directory",
+			configPath: filepath.Join(home, ".cc-connect", "config.toml"),
+			want:       filepath.Join(home, ".cc-connect"),
+			skipNoHome: true,
+		},
+		{
+			name:       "config elsewhere falls back to home",
+			configPath: "/opt/deploy/config.toml",
+			want:       filepath.Join(home, ".cc-connect"),
+			skipNoHome: true,
+		},
+		{
+			name:       "bare relative path falls back to home",
+			configPath: "config.toml",
+			want:       filepath.Join(home, ".cc-connect"),
+			skipNoHome: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.skipNoHome && homeErr != nil {
+				t.Skip("no home dir")
+			}
+			if got := defaultDataDir(tt.configPath); got != tt.want {
+				t.Errorf("defaultDataDir(%q) = %q, want %q", tt.configPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func mustGetwd(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wd
+}

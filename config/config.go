@@ -649,11 +649,7 @@ func load(path string) (*Config, error) {
 	resolveEnvInConfig(cfg)
 	expandHomeInConfig(cfg)
 	if cfg.DataDir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			cfg.DataDir = filepath.Join(home, ".cc-connect")
-		} else {
-			cfg.DataDir = ".cc-connect"
-		}
+		cfg.DataDir = defaultDataDir(path)
 	}
 	cfg.AttachmentSend = strings.ToLower(strings.TrimSpace(cfg.AttachmentSend))
 	if cfg.AttachmentSend == "" {
@@ -661,6 +657,32 @@ func load(path string) (*Config, error) {
 	}
 	cfg.ResolveProviderRefs()
 	return cfg, nil
+}
+
+// defaultDataDir picks the data directory for a config that leaves data_dir
+// unset. A config living inside a .cc-connect directory keeps its data
+// alongside itself, so a self-contained deployment stays self-contained;
+// anything else falls back to the invoking user's home.
+//
+// The result is always absolute: it is handed to spawned agent processes,
+// which run with the project's work_dir as their working directory, so a
+// relative path would resolve against the wrong directory there.
+func defaultDataDir(configPath string) string {
+	if dir := filepath.Dir(configPath); filepath.Base(dir) == ".cc-connect" {
+		return absOrSelf(dir)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".cc-connect")
+	}
+	return absOrSelf(".cc-connect")
+}
+
+func absOrSelf(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
 }
 
 // LoadPermissive loads the config file and performs all validation except the

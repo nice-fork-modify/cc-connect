@@ -2653,6 +2653,74 @@ func TestResolveDisabledCmds_WildcardCoversAliases(t *testing.T) {
 	}
 }
 
+func TestResolveEnabledCmds(t *testing.T) {
+	if m := resolveEnabledCmds(nil); m != nil {
+		t.Errorf("unset enabled_commands should impose no restriction, got %v", m)
+	}
+	if m := resolveEnabledCmds([]string{""}); m != nil {
+		t.Errorf("blank-only enabled_commands should impose no restriction, got %v", m)
+	}
+	if m := resolveEnabledCmds([]string{"new", "*"}); m != nil {
+		t.Errorf("wildcard should impose no restriction, got %v", m)
+	}
+	m := resolveEnabledCmds([]string{"/New", " stop ", ""})
+	if !reflect.DeepEqual(m, map[string]bool{"new": true, "stop": true}) {
+		t.Errorf("resolveEnabledCmds = %v", m)
+	}
+}
+
+func TestResolveCommandPolicy_EnabledDisablesEverythingElse(t *testing.T) {
+	m := resolveCommandPolicy([]string{"new", "btw"}, nil)
+	if m["new"] || m["btw"] {
+		t.Error("whitelisted names must stay usable")
+	}
+	// "ps" shares a command with "btw", but only the listed name survives.
+	if !m["ps"] {
+		t.Error("unlisted alias \"ps\" should be disabled")
+	}
+	for _, bc := range builtinCommands {
+		for _, n := range bc.names {
+			if n == "new" || n == "btw" {
+				continue
+			}
+			if !m[n] {
+				t.Errorf("name %q should be disabled", n)
+			}
+		}
+	}
+}
+
+func TestResolveCommandPolicy_DisabledAppliesOnTopOfEnabled(t *testing.T) {
+	m := resolveCommandPolicy([]string{"shell", "sh"}, []string{"sh"})
+	if m["shell"] {
+		t.Error("\"shell\" should stay usable")
+	}
+	if !m["sh"] {
+		t.Error("disabled_commands should still drop \"sh\"")
+	}
+}
+
+func TestResolveCommandPolicy_WithoutEnabledFallsBackToDisabled(t *testing.T) {
+	want := resolveDisabledCmds([]string{"ps"})
+	if got := resolveCommandPolicy(nil, []string{"ps"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("policy without enabled_commands = %v, want %v", got, want)
+	}
+	if got := resolveCommandPolicy([]string{"*"}, []string{"ps"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("policy with wildcard enabled_commands = %v, want %v", got, want)
+	}
+}
+
+func TestEngine_SetCommandPolicyKeepsOnlyEnabledNames(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"new", "stop"}, nil)
+	if e.disabledCmds["new"] || e.disabledCmds["stop"] {
+		t.Error("whitelisted names must stay usable")
+	}
+	if !e.disabledCmds["restart"] {
+		t.Error("unlisted name should be disabled")
+	}
+}
+
 func TestDisabledCmdLeftovers(t *testing.T) {
 	got := disabledCmdLeftovers(resolveDisabledCmds([]string{"shell", "ps", "help"}))
 

@@ -1226,6 +1226,54 @@ func resolveDisabledCmds(cmds []string) map[string]bool {
 	return m
 }
 
+// resolveEnabledCmds normalizes an enabled_commands list into the set of names
+// to keep. It returns nil when the list imposes no restriction — unset, empty,
+// or the "*" wildcard — so callers can tell "keep nothing" from "keep all".
+func resolveEnabledCmds(cmds []string) map[string]bool {
+	var m map[string]bool
+	for _, c := range cmds {
+		c = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(c, "/")))
+		if c == "*" {
+			return nil
+		}
+		if c == "" {
+			continue
+		}
+		if m == nil {
+			m = make(map[string]bool, len(cmds))
+		}
+		m[c] = true
+	}
+	return m
+}
+
+// resolveCommandPolicy turns a project's enabled_commands and disabled_commands
+// into the single set of names that must stop working.
+//
+// enabled_commands is the inverse form: when it restricts anything, every
+// built-in name outside it is disabled, so a deployment can list the handful of
+// commands it wants instead of enumerating everything it does not.
+// disabled_commands is applied on top, which keeps the two combinable — a
+// command can be whitelisted while one of its aliases is still dropped.
+func resolveCommandPolicy(enabled, disabled []string) map[string]bool {
+	m := resolveDisabledCmds(disabled)
+	keep := resolveEnabledCmds(enabled)
+	if keep == nil {
+		return m
+	}
+	for _, c := range builtinCommands {
+		for _, n := range c.names {
+			if !keep[n] {
+				m[n] = true
+			}
+		}
+		if !keep[c.id] {
+			m[c.id] = true
+		}
+	}
+	return m
+}
+
 // disabledCmdLeftovers reports, for every built-in command that had some but
 // not all of its names disabled, the names that still work. Exact matching
 // makes a partial entry easy to write by accident — disabling "shell" while
@@ -1271,13 +1319,19 @@ func (e *Engine) GetDisabledCommands() []string {
 
 // SetDisabledCommands sets the command names that are disabled for this project.
 func (e *Engine) SetDisabledCommands(cmds []string) {
+	e.SetCommandPolicy(nil, cmds)
+}
+
+// SetCommandPolicy applies this project's enabled_commands and
+// disabled_commands together, replacing any policy set earlier.
+func (e *Engine) SetCommandPolicy(enabled, disabled []string) {
 	e.userRolesMu.Lock()
-	resolved := resolveDisabledCmds(cmds)
+	resolved := resolveCommandPolicy(enabled, disabled)
 	e.disabledCmds = resolved
 	e.userRolesMu.Unlock()
 
 	for id, live := range disabledCmdLeftovers(resolved) {
-		slog.Info("disabled_commands: command still reachable under other names",
+		slog.Info("command policy: command still reachable under other names",
 			"project", e.name, "command", id, "still_usable", live)
 	}
 }

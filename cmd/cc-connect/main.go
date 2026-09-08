@@ -536,9 +536,9 @@ func main() {
 			engine.SetBannedWords(cfg.BannedWords)
 		}
 
-		// Wire disabled commands (project-level)
-		if len(proj.DisabledCommands) > 0 {
-			engine.SetDisabledCommands(proj.DisabledCommands)
+		// Wire command policy (project-level)
+		if len(proj.EnabledCommands) > 0 || len(proj.DisabledCommands) > 0 {
+			engine.SetCommandPolicy(proj.EnabledCommands, proj.DisabledCommands)
 		}
 
 		// Wire admin allowlist for privileged commands
@@ -1891,8 +1891,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	// Reload banned words
 	engine.SetBannedWords(cfg.BannedWords)
 
-	// Reload disabled commands
-	engine.SetDisabledCommands(proj.DisabledCommands)
+	// Reload command policy
+	engine.SetCommandPolicy(proj.EnabledCommands, proj.DisabledCommands)
 
 	// Reload admin allowlist
 	engine.SetAdminFrom(proj.AdminFrom)

@@ -764,6 +764,8 @@ name = "my-backend"
 #                                                     # 禁用该项目的指定命令
 # Names match exactly: ["shell"] leaves /sh /exec /run working, "*" disables all.
 # 按名字精确匹配：只写 ["shell"] 时 /sh /exec /run 仍可用，"*" 表示全部。
+# enabled_commands = ["new", "list", "stop"]  # Keep only these; everything else is disabled
+#                                             # 只保留这些命令，其余全部禁用
 #
 # filter_external_sessions: when true, /list /switch /delete only show sessions
 # created by cc-connect, hiding sessions from direct CLI usage in the same work_dir.

@@ -1711,6 +1711,19 @@ func TestLoad_ParsesDisabledCommands(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesEnabledCommands(t *testing.T) {
+	configPath := writeConfigFixture(t, projectWithEnabledCommandsFixture)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	want := []string{"new", "list", "stop"}
+	if got := cfg.Projects[0].EnabledCommands; !reflect.DeepEqual(got, want) {
+		t.Fatalf("enabled_commands = %v, want %v", got, want)
+	}
+}
+
 func TestLoad_ParsesResetOnIdleMins(t *testing.T) {
 	configPath := writeConfigFixture(t, projectWithResetOnIdleFixture)
 
@@ -2162,6 +2175,24 @@ const projectWithDisabledCommandsFixture = `
 [[projects]]
 name = "beta"
 disabled_commands = ["restart", "ps", "sh"]
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "/tmp/beta"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+bot_token = "token_xxx"
+`
+
+const projectWithEnabledCommandsFixture = `
+[[projects]]
+name = "beta"
+enabled_commands = ["new", "list", "stop"]
 
 [projects.agent]
 type = "codex"

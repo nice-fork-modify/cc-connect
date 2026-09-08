@@ -534,6 +534,7 @@ type ProjectConfig struct {
 	// entirely (the per-line indicator flags above become no-ops).
 	ReplyFooter      *bool        `toml:"reply_footer,omitempty"`
 	InjectSender     *bool        `toml:"inject_sender,omitempty"`     // prepend sender identity (platform + user ID) to each message sent to the agent
+	EnabledCommands  []string     `toml:"enabled_commands,omitempty"`  // when non-empty, only these command names work; "*" = no restriction
 	DisabledCommands []string     `toml:"disabled_commands,omitempty"` // command names to disable, matched exactly as typed (e.g. ["restart", "sh"]); "*" = all
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users
 	Users            *UsersConfig `toml:"users,omitempty"`             // per-user role config; nil = legacy behavior

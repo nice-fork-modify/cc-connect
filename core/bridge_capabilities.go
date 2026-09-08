@@ -56,7 +56,7 @@ type bridgePublishedCommand struct {
 // grows beyond the single free-form "args" text bucket.
 func (e *Engine) GetBridgePublishedCommands() []bridgePublishedCommand {
 	e.userRolesMu.RLock()
-	disabledCmds := e.disabledCmds
+	disabledCmds := e.menuDisabledCmds
 	e.userRolesMu.RUnlock()
 
 	seen := make(map[string]bool)

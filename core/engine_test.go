@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2718,6 +2719,76 @@ func TestEngine_SetCommandPolicyKeepsOnlyEnabledNames(t *testing.T) {
 	}
 	if !e.disabledCmds["restart"] {
 		t.Error("unlisted name should be disabled")
+	}
+}
+
+func TestEngine_ResumeImpliesSwitchWithoutConfiguringIt(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"resume"}, nil)
+
+	if e.disabledCmds["switch"] {
+		t.Error("/resume's buttons send /switch, so it must be dispatchable")
+	}
+	if !e.menuDisabledCmds["switch"] {
+		t.Error("an implied dependency should stay out of the command menu")
+	}
+	if e.disabledCmds["resume"] {
+		t.Error("/resume itself should be usable")
+	}
+}
+
+func TestEngine_ResumeMenuOmitsImpliedSwitch(t *testing.T) {
+	e := newTestEngine()
+	e.SetCommandPolicy([]string{"resume"}, nil)
+
+	var names []string
+	for _, c := range e.GetAllCommands() {
+		names = append(names, c.Command)
+	}
+	if !slices.Contains(names, "resume") {
+		t.Errorf("menu = %v, want /resume", names)
+	}
+	if slices.Contains(names, "switch") {
+		t.Errorf("menu = %v, should not gain /switch from the dependency", names)
+	}
+}
+
+func TestEngine_ExplicitDisableOutranksDependency(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"resume", "switch"}, []string{"switch"})
+
+	if !e.disabledCmds["switch"] {
+		t.Error("disabled_commands names an explicit off that the dependency must not undo")
+	}
+}
+
+func TestEngine_DependencyIsNotAppliedWhenDriverIsDisabled(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"new"}, nil)
+
+	if !e.disabledCmds["switch"] {
+		t.Error("/resume is disabled, so nothing should re-enable /switch")
+	}
+}
+
+func TestApplyCommandDeps_ReusesPolicyWhenNothingChanges(t *testing.T) {
+	policy := resolveDisabledCmds([]string{"restart"})
+	before := len(policy)
+	out := applyCommandDeps(policy, nil)
+	if len(out) != before {
+		t.Errorf("policy should be untouched, got %d entries want %d", len(out), before)
+	}
+	if out["restart"] != true {
+		t.Error("unrelated disables must survive")
+	}
+}
+
+func TestGetDisabledCommands_ReportsConfiguredNotEffective(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"resume"}, nil)
+
+	if !slices.Contains(e.GetDisabledCommands(), "switch") {
+		t.Error("the config disabled /switch; the internal dependency should not hide that")
 	}
 }
 

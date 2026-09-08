@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
@@ -401,10 +402,11 @@ type Engine struct {
 	bannedWords []string
 	bannedMu    sync.RWMutex
 
-	disabledCmds map[string]bool  // command names, matched exactly as typed
-	adminFrom    string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
-	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
-	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
+	disabledCmds     map[string]bool  // command names, matched exactly as typed
+	menuDisabledCmds map[string]bool  // same, but without dependencies re-enabled; drives the command menu only
+	adminFrom        string           // comma-separated user IDs for privileged commands; "*" = all allowed users; "" = deny
+	userRoles        *UserRoleManager // nil = legacy mode (no per-user policies)
+	userRolesMu      sync.RWMutex     // protects userRoles, disabledCmds, menuDisabledCmds, and adminFrom
 
 	rateLimiter         *RateLimiter
 	outgoingRL          *OutgoingRateLimiter
@@ -1274,6 +1276,67 @@ func resolveCommandPolicy(enabled, disabled []string) map[string]bool {
 	return m
 }
 
+// commandDeps maps a command id to the command ids it drives on the user's
+// behalf. /resume renders one button per session and each button sends
+// /switch, so a config that enables /resume without also listing /switch would
+// produce dead buttons. Resolving the dependency here means a config only has
+// to name the command the user actually asked for.
+var commandDeps = map[string][]string{
+	"resume": {"switch"},
+}
+
+// commandNames returns the names a built-in command answers to, or nil for an
+// unknown id.
+func commandNames(id string) []string {
+	for _, c := range builtinCommands {
+		if c.id == id {
+			return c.names
+		}
+	}
+	return nil
+}
+
+// commandUsable reports whether a command can still be reached under at least
+// one of its names.
+func commandUsable(id string, disabled map[string]bool) bool {
+	for _, n := range commandNames(id) {
+		if !disabled[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// applyCommandDeps returns policy with the dependencies of every usable command
+// made usable too, or policy itself when nothing needed re-enabling.
+//
+// Names in explicit — the project's disabled_commands — stay disabled: an
+// explicit "off" outranks an implied "on". The returned set drives dispatch
+// only; the command menu keeps using the configured policy, so enabling
+// /resume does not add /switch to a deliberately short menu.
+func applyCommandDeps(policy, explicit map[string]bool) map[string]bool {
+	out := policy
+	cloned := false
+	for driver, deps := range commandDeps {
+		if !commandUsable(driver, policy) {
+			continue
+		}
+		for _, dep := range deps {
+			for _, n := range commandNames(dep) {
+				if explicit[n] || !out[n] {
+					continue
+				}
+				if !cloned {
+					out = maps.Clone(policy)
+					cloned = true
+				}
+				delete(out, n)
+			}
+		}
+	}
+	return out
+}
+
 // disabledCmdLeftovers reports, for every built-in command that had some but
 // not all of its names disabled, the names that still work. Exact matching
 // makes a partial entry easy to write by accident — disabling "shell" while
@@ -1305,12 +1368,13 @@ func disabledCmdLeftovers(disabled map[string]bool) map[string][]string {
 	return out
 }
 
-// GetDisabledCommands returns the list of disabled command IDs for this project.
+// GetDisabledCommands returns the disabled command names for this project as
+// configured, without the dependencies that are re-enabled internally.
 func (e *Engine) GetDisabledCommands() []string {
 	e.userRolesMu.RLock()
 	defer e.userRolesMu.RUnlock()
-	out := make([]string, 0, len(e.disabledCmds))
-	for k := range e.disabledCmds {
+	out := make([]string, 0, len(e.menuDisabledCmds))
+	for k := range e.menuDisabledCmds {
 		out = append(out, k)
 	}
 	sort.Strings(out)
@@ -1325,9 +1389,13 @@ func (e *Engine) SetDisabledCommands(cmds []string) {
 // SetCommandPolicy applies this project's enabled_commands and
 // disabled_commands together, replacing any policy set earlier.
 func (e *Engine) SetCommandPolicy(enabled, disabled []string) {
-	e.userRolesMu.Lock()
 	resolved := resolveCommandPolicy(enabled, disabled)
-	e.disabledCmds = resolved
+
+	e.userRolesMu.Lock()
+	// Dependencies are dispatchable but stay out of the menu, so the menu shows
+	// exactly what the project asked for.
+	e.disabledCmds = applyCommandDeps(resolved, resolveDisabledCmds(disabled))
+	e.menuDisabledCmds = resolved
 	e.userRolesMu.Unlock()
 
 	for id, live := range disabledCmdLeftovers(resolved) {
@@ -10199,7 +10267,7 @@ func (e *Engine) GetAllCommands() []BotCommandInfo {
 	var commands []BotCommandInfo
 
 	e.userRolesMu.RLock()
-	disabledCmds := e.disabledCmds
+	disabledCmds := e.menuDisabledCmds
 	e.userRolesMu.RUnlock()
 
 	// Collect built-in  commands (use primary name, first in names list)

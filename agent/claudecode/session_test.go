@@ -1387,3 +1387,27 @@ func TestHandleResultKeepsLiveAssistantUsage(t *testing.T) {
 		t.Errorf("OutputTokens = %d, want 406 (result is authoritative for output)", u.OutputTokens)
 	}
 }
+
+func TestIsSandboxEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		extraEnv []string
+		osEnv    string
+		want     bool
+	}{
+		{"project env opts out", []string{"IS_SANDBOX=1"}, "", true},
+		{"project env overrides process env", []string{"IS_SANDBOX=0"}, "1", false},
+		{"falls back to process env", nil, "1", true},
+		{"unset everywhere", []string{"FOO=bar"}, "", false},
+		{"non-1 value is not an opt-out", []string{"IS_SANDBOX=true"}, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("IS_SANDBOX", tt.osEnv)
+			if got := isSandboxEnv(tt.extraEnv); got != tt.want {
+				t.Errorf("isSandboxEnv(%q) with IS_SANDBOX=%q = %v, want %v",
+					tt.extraEnv, tt.osEnv, got, tt.want)
+			}
+		})
+	}
+}

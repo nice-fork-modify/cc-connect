@@ -864,6 +864,12 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # - "bypassPermissions" (yolo): All tool calls auto-approved. Use with caution. / 全部自动通过，请谨慎使用。
 # - "dontAsk" (dont-ask): Auto-deny tools unless pre-approved via allowed_tools or settings allow rules. / 未预授权的工具自动拒绝，安全推荐。
 #
+# Running as root, "bypassPermissions" is downgraded to "auto". Set IS_SANDBOX = "1"
+# (in the env block below, or in cc-connect's own environment) to keep it — only do
+# this when the host is a disposable sandbox.
+# root 身份运行时，"bypassPermissions" 会被降级为 "auto"。设置 IS_SANDBOX = "1"
+# （在下方 env 中，或 cc-connect 自身的环境变量里）可保持原模式，仅建议在一次性沙箱环境中使用。
+#
 # When using IM platforms, you can reply "允许"/"allow" to grant permission.
 # 在 IM 平台中，可回复"允许"或"allow"来授权操作。
 
@@ -909,6 +915,15 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # ANTHROPIC_DEFAULT_HAIKU_MODEL = "K2.6"
 # ANTHROPIC_DEFAULT_SONNET_MODEL = "K2.6"
 # ANTHROPIC_DEFAULT_OPUS_MODEL = "K2.6"
+#
+# A few variables read alongside cmd = [...] are easier to keep inline; env
+# also accepts an array of KEY=VALUE pairs, written inside the options table.
+# 只有少量变量、想和 cmd = [...] 写在一起时，env 也支持 KEY=VALUE 数组形式，
+# 直接写在 options 表内即可。
+#
+# [projects.agent.options]
+# cmd = ["claude"]
+# env = ["IS_SANDBOX=1"]
 
 # Claude Code Router Integration / Claude Code Router 集成
 # Route Claude Code requests through Claude Code Router to use different model providers.

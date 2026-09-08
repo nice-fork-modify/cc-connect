@@ -325,8 +325,28 @@ func TestParseConfigEnv(t *testing.T) {
 			want: []string{},
 		},
 		{
+			name: "env array of pairs",
+			opts: map[string]any{"env": []string{"FOO=bar", "BAZ=qux"}},
+			want: []string{"FOO=bar", "BAZ=qux"},
+		},
+		{
+			name: "env array any string values (TOML output)",
+			opts: map[string]any{"env": []any{"FOO=bar", "BAZ=qux"}},
+			want: []string{"FOO=bar", "BAZ=qux"},
+		},
+		{
+			name: "env array any with non-string element is skipped",
+			opts: map[string]any{"env": []any{"FOO=bar", 42}},
+			want: []string{"FOO=bar"},
+		},
+		{
+			name: "env empty array",
+			opts: map[string]any{"env": []any{}},
+			want: []string{},
+		},
+		{
 			name: "env unsupported type returns nil",
-			opts: map[string]any{"env": []string{"FOO=bar"}},
+			opts: map[string]any{"env": "FOO=bar"},
 			want: nil,
 		},
 		{

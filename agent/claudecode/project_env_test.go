@@ -73,6 +73,35 @@ func TestNew_ParsesProjectEnvFromMapStringAny(t *testing.T) {
 	}
 }
 
+func TestNew_ParsesProjectEnvFromArray(t *testing.T) {
+	// env = ["IS_SANDBOX=1"] in config.toml arrives as []any of strings.
+	opts := map[string]any{
+		"work_dir":    t.TempDir(),
+		"run_as_user": "test-user",
+		"env":         []any{"IS_SANDBOX=1", "ANTHROPIC_MODEL=K2.6"},
+	}
+
+	a, err := New(opts)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	agent := a.(*Agent)
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+
+	envMap := envSliceToMap(agent.configEnv)
+	if got := envMap["IS_SANDBOX"]; got != "1" {
+		t.Errorf("IS_SANDBOX = %q, want %q", got, "1")
+	}
+	if got := envMap["ANTHROPIC_MODEL"]; got != "K2.6" {
+		t.Errorf("ANTHROPIC_MODEL = %q, want %q", got, "K2.6")
+	}
+	if !isSandboxEnv(agent.configEnv) {
+		t.Error("array-form IS_SANDBOX=1 must keep bypassPermissions under root")
+	}
+}
+
 func TestNew_NoEnvOpts(t *testing.T) {
 	opts := map[string]any{
 		"work_dir":    t.TempDir(),

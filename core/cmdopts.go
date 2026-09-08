@@ -113,8 +113,10 @@ func filterNonEmpty(parts []string) []string {
 // ParseConfigEnv parses opts["env"] (set via [projects.agent.options.env]
 // in config.toml) into a []string of KEY=VALUE pairs.
 //
-// Supports both map[string]string and map[string]any (from TOML parser).
-// Returns nil when no env is configured.
+// Two config shapes are accepted: a table — env = { KEY = "value" } or its
+// [projects.agent.options.env] form, arriving as map[string]string or
+// map[string]any — and an array of already-joined pairs, env = ["KEY=value"],
+// arriving as []string or []any. Returns nil when no env is configured.
 //
 // The returned slice should be stored separately from sessionEnv so that
 // SetSessionEnv calls cannot overwrite static config env.
@@ -136,6 +138,18 @@ func ParseConfigEnv(opts map[string]any) []string {
 		for k, v := range m {
 			if s, ok := v.(string); ok {
 				env = append(env, k+"="+s)
+			}
+		}
+		return env
+	case []string:
+		env := make([]string, 0, len(m))
+		env = append(env, m...)
+		return env
+	case []any:
+		env := make([]string, 0, len(m))
+		for _, v := range m {
+			if s, ok := v.(string); ok {
+				env = append(env, s)
 			}
 		}
 		return env

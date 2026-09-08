@@ -238,18 +238,7 @@ func New(opts map[string]any) (core.Agent, error) {
 
 	// Parse project-level env from opts["env"] (set via [projects.agent.options.env] in config.toml).
 	// Stored separately from runtime sessionEnv so SetSessionEnv calls cannot overwrite it.
-	var configEnv []string
-	if envMap, ok := opts["env"].(map[string]string); ok {
-		for k, v := range envMap {
-			configEnv = append(configEnv, k+"="+v)
-		}
-	} else if envMap, ok := opts["env"].(map[string]any); ok {
-		for k, v := range envMap {
-			if s, ok := v.(string); ok {
-				configEnv = append(configEnv, k+"="+s)
-			}
-		}
-	}
+	configEnv := core.ParseConfigEnv(opts)
 
 	// Eagerly materialise the shared cc-connect-system.md at startup so
 	// the file exists on disk before the first spawn. claude reads it

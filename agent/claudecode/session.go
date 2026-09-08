@@ -244,8 +244,10 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 
 	// Claude Code rejects bypassPermissions when running as root.
 	// Downgrade to "auto" which auto-approves internally in cc-connect.
+	// IS_SANDBOX=1 opts out, mirroring the CLI's own escape hatch for
+	// sandboxed root environments.
 	var rootDowngradeWarning string
-	if mode == "bypassPermissions" && os.Geteuid() == 0 {
+	if mode == "bypassPermissions" && os.Geteuid() == 0 && !isSandboxEnv(extraEnv) {
 		slog.Warn("claudeSession: bypassPermissions not allowed under root, downgrading to auto mode")
 		mode = "auto"
 		rootDowngradeWarning = "⚠️ Running as root: bypassPermissions mode is not supported and has been downgraded to auto. The agent may still pause on high-risk operations."
@@ -1674,6 +1676,20 @@ func claudeContextWindow(model string) int {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+// isSandboxEnv reports whether IS_SANDBOX=1 is set, either in the project's
+// agent env or in cc-connect's own environment. Matching the CLI's escape
+// hatch lets a sandboxed root deployment keep bypassPermissions instead of
+// being downgraded to auto. extraEnv wins because it is merged over the
+// inherited environment when the process is spawned.
+func isSandboxEnv(extraEnv []string) bool {
+	for _, e := range extraEnv {
+		if v, ok := strings.CutPrefix(e, "IS_SANDBOX="); ok {
+			return v == "1"
+		}
+	}
+	return os.Getenv("IS_SANDBOX") == "1"
 }
 
 // filterEnv returns a copy of env with entries matching the given key removed.

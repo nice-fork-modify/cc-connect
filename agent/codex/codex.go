@@ -79,18 +79,7 @@ func New(opts map[string]any) (core.Agent, error) {
 	// Stored separately from runtime sessionEnv so SetSessionEnv calls cannot overwrite it.
 	// MergeEnv semantics ensure these override any same-named keys inherited from os.Environ()
 	// when the codex subprocess is spawned (e.g. user-scoped HTTPS_PROXY leaking into the agent).
-	var configEnv []string
-	if envMap, ok := opts["env"].(map[string]string); ok {
-		for k, v := range envMap {
-			configEnv = append(configEnv, k+"="+v)
-		}
-	} else if envMap, ok := opts["env"].(map[string]any); ok {
-		for k, v := range envMap {
-			if s, ok := v.(string); ok {
-				configEnv = append(configEnv, k+"="+s)
-			}
-		}
-	}
+	configEnv := core.ParseConfigEnv(opts)
 
 	return &Agent{
 		workDir:         workDir,

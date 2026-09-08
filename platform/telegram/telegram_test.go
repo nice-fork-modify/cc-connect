@@ -1036,3 +1036,21 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 	}
 }
 
+func TestIsTooLongErr(t *testing.T) {
+	tests := []struct {
+		errMsg string
+		want   bool
+	}{
+		// Wording actually returned by Bot API for an oversized /skills reply.
+		{"telegram: send: bad request, Bad Request: text is too long", true},
+		{"bad request, Bad Request: message is too long", true},
+		{"bad request, Bad Request: can't parse entities", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isTooLongErr(tt.errMsg); got != tt.want {
+			t.Errorf("isTooLongErr(%q) = %v, want %v", tt.errMsg, got, tt.want)
+		}
+	}
+}
+

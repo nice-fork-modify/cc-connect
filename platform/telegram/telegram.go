@@ -1067,7 +1067,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 			params.Text = content
 			params.ParseMode = ""
 			_, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
+		} else if isTooLongErr(errMsg) {
 			// Handle message too long by splitting and sending as multiple messages
 			slog.Warn("telegram: message too long, splitting into chunks",
 				"method", "Reply",
@@ -1114,7 +1114,7 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 			params.Text = content
 			params.ParseMode = ""
 			_, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
+		} else if isTooLongErr(errMsg) {
 			// Handle message too long by splitting and sending as multiple messages
 			slog.Warn("telegram: message too long, splitting into chunks",
 				"method", "Send",
@@ -1310,7 +1310,7 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 			params.Text = content
 			params.ParseMode = ""
 			_, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
+		} else if isTooLongErr(errMsg) {
 			// Handle message too long: first chunk with buttons, rest without
 			slog.Warn("telegram: message too long, splitting into chunks",
 				"method", "SendWithButtons",
@@ -1447,7 +1447,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 			params.Text = content
 			params.ParseMode = ""
 			sent, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
+		} else if isTooLongErr(errMsg) {
 			// Preview messages shouldn't be chunked; fall back to plain text
 			slog.Warn("telegram: preview too long, sending as plain text",
 				"method", "SendPreviewStart",
@@ -1521,6 +1521,17 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 // telegramMaxMessageLen is the maximum message length for Telegram.
 // Telegram's limit is 4096 characters for text messages.
 const telegramMaxMessageLen = 4096
+
+// isTooLongErr reports whether Bot API rejected a send for exceeding the
+// message length limit. The API is not consistent about the wording — a
+// moderately oversized message comes back as "message is too long" while a
+// much larger one (e.g. /skills on a host with many skills) comes back as
+// "text is too long" — so both have to be recognised or the caller skips
+// chunking and drops the reply.
+func isTooLongErr(errMsg string) bool {
+	return strings.Contains(errMsg, "message is too long") ||
+		strings.Contains(errMsg, "text is too long")
+}
 
 // sendChunked splits a message that's too long and sends it as multiple messages.
 // It uses SplitMessageCodeFenceAware to respect code block boundaries.

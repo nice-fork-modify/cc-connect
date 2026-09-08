@@ -1337,6 +1337,30 @@ func applyCommandDeps(policy, explicit map[string]bool) map[string]bool {
 	return out
 }
 
+// applyAliasIDs returns policy with the canonical id of every still-usable
+// command made usable too, or policy itself when nothing needed re-enabling.
+//
+// handleCommand resolves what the user typed to a canonical id and then
+// re-checks that id, so a whitelist naming only an alias — enabled_commands =
+// ["sh"] — would resolve /sh to the id "shell" and reject it even though "sh"
+// itself was never disabled. Ids in explicit — the project's
+// disabled_commands — stay disabled, keeping "off" ahead of an implied "on".
+func applyAliasIDs(policy, explicit map[string]bool) map[string]bool {
+	out := policy
+	cloned := false
+	for _, c := range builtinCommands {
+		if explicit[c.id] || !out[c.id] || !commandUsable(c.id, policy) {
+			continue
+		}
+		if !cloned {
+			out = maps.Clone(policy)
+			cloned = true
+		}
+		delete(out, c.id)
+	}
+	return out
+}
+
 // disabledCmdLeftovers reports, for every built-in command that had some but
 // not all of its names disabled, the names that still work. Exact matching
 // makes a partial entry easy to write by accident — disabling "shell" while
@@ -1391,10 +1415,12 @@ func (e *Engine) SetDisabledCommands(cmds []string) {
 func (e *Engine) SetCommandPolicy(enabled, disabled []string) {
 	resolved := resolveCommandPolicy(enabled, disabled)
 
+	explicit := resolveDisabledCmds(disabled)
+
 	e.userRolesMu.Lock()
-	// Dependencies are dispatchable but stay out of the menu, so the menu shows
-	// exactly what the project asked for.
-	e.disabledCmds = applyCommandDeps(resolved, resolveDisabledCmds(disabled))
+	// Dependencies and alias ids are dispatchable but stay out of the menu, so
+	// the menu shows exactly what the project asked for.
+	e.disabledCmds = applyAliasIDs(applyCommandDeps(resolved, explicit), explicit)
 	e.menuDisabledCmds = resolved
 	e.userRolesMu.Unlock()
 

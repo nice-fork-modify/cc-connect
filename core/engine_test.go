@@ -2722,6 +2722,60 @@ func TestEngine_SetCommandPolicyKeepsOnlyEnabledNames(t *testing.T) {
 	}
 }
 
+func TestEngine_EnabledAliasStaysDispatchable(t *testing.T) {
+	// Every one of these is an alias whose command is filed under a different
+	// canonical id: sh/shell, cd/dir, btw/ps, rename/name, effort/reasoning,
+	// compact/compress. handleCommand resolves the alias to that id and
+	// re-checks it, so whitelisting the alias alone has to keep the id usable.
+	aliases := []string{"sh", "cd", "btw", "rename", "effort", "compact"}
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy(aliases, nil)
+
+	for _, alias := range aliases {
+		if e.disabledCmds[alias] {
+			t.Errorf("/%s was whitelisted but is disabled", alias)
+		}
+		id := matchPrefix(alias, commandCandidates(e.disabledCmds))
+		if id == "" {
+			t.Errorf("/%s no longer resolves to a command", alias)
+			continue
+		}
+		if e.disabledCmds[id] {
+			t.Errorf("/%s resolves to id %q, which is disabled", alias, id)
+		}
+	}
+}
+
+func TestEngine_AliasIDRescueLeavesUnlistedCommandsDisabled(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"sh"}, nil)
+
+	// "delete" has no whitelisted name, so nothing rescues its id.
+	if !e.disabledCmds["delete"] {
+		t.Error("a command with no enabled name must stay disabled")
+	}
+	if !e.menuDisabledCmds["shell"] {
+		t.Error("the rescued id should stay out of the menu so it shows /sh")
+	}
+}
+
+func TestEngine_ExplicitDisableOutranksAliasIDRescue(t *testing.T) {
+	e := &Engine{name: "p"}
+	e.SetCommandPolicy([]string{"sh"}, []string{"shell"})
+
+	if !e.disabledCmds["shell"] {
+		t.Error("an explicit disabled_commands entry must survive the rescue")
+	}
+}
+
+func TestApplyAliasIDs_ReusesPolicyWhenNothingChanges(t *testing.T) {
+	policy := resolveDisabledCmds([]string{"restart"})
+	out := applyAliasIDs(policy, policy)
+	if len(out) != len(policy) {
+		t.Fatalf("policy was rewritten: got %d entries, want %d", len(out), len(policy))
+	}
+}
+
 func TestEngine_ResumeImpliesSwitchWithoutConfiguringIt(t *testing.T) {
 	e := &Engine{name: "p"}
 	e.SetCommandPolicy([]string{"resume"}, nil)

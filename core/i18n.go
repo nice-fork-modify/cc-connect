@@ -587,6 +587,7 @@ const (
 	MsgBuiltinCmdList      MsgKey = "list"
 	MsgBuiltinCmdSearch    MsgKey = "search"
 	MsgBuiltinCmdSwitch    MsgKey = "switch"
+	MsgBuiltinCmdResume    MsgKey = "resume"
 	MsgBuiltinCmdDelete    MsgKey = "delete"
 	MsgBuiltinCmdName      MsgKey = "name"
 	MsgBuiltinCmdCurrent   MsgKey = "current"
@@ -1041,6 +1042,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list\n  List agent sessions\n\n" +
 			"/search <keyword>\n  Search sessions by name or ID\n\n" +
 			"/switch <number>\n  Resume a session by its list number\n\n" +
+			"/resume [page]\n  Pick a session to resume from a tappable list\n\n" +
 			"/delete <number>|1,2,3|3-7|1,3-5,8\n  Delete sessions by list number(s)\n\n" +
 			"/name [number] <text>\n  Name a session for easy identification\n\n" +
 			"/current\n  Show current active session\n\n" +
@@ -1085,6 +1087,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list\n  列出 Agent 会话列表\n\n" +
 			"/search <关键词>\n  搜索会话名称或 ID\n\n" +
 			"/switch <序号>\n  按列表序号切换会话\n\n" +
+			"/resume [页码]\n  从可点击列表中挑选要恢复的会话\n\n" +
 			"/delete <序号>|1,2,3|3-7|1,3-5,8\n  按列表序号批量/单个删除会话\n\n" +
 			"/name [序号] <名称>\n  给会话命名，方便识别\n\n" +
 			"/current\n  查看当前活跃会话\n\n" +
@@ -1129,6 +1132,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list\n  列出 Agent 會話列表\n\n" +
 			"/search <關鍵詞>\n  搜尋會話名稱或 ID\n\n" +
 			"/switch <序號>\n  按列表序號切換會話\n\n" +
+			"/resume [頁碼]\n  從可點擊列表中挑選要恢復的會話\n\n" +
 			"/delete <序號>|1,2,3|3-7|1,3-5,8\n  按列表序號批量/單筆刪除會話\n\n" +
 			"/name [序號] <名稱>\n  為會話命名，方便辨識\n\n" +
 			"/current\n  查看當前活躍會話\n\n" +
@@ -1171,6 +1175,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/new [名前]\n  新しいセッションを開始\n\n" +
 			"/list\n  エージェントセッション一覧\n\n" +
 			"/switch <番号>\n  リスト番号でセッションを切り替え\n\n" +
+			"/resume [ページ]\n  タップできる一覧から再開するセッションを選択\n\n" +
 			"/delete <番号>|1,2,3|3-7|1,3-5,8\n  リスト番号でセッションを単体/複数削除\n\n" +
 			"/name [番号] <名前>\n  セッションに名前を付ける\n\n" +
 			"/current\n  現在のアクティブセッションを表示\n\n" +
@@ -1213,6 +1218,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/new [nombre]\n  Iniciar una nueva sesión\n\n" +
 			"/list\n  Listar sesiones del agente\n\n" +
 			"/switch <número>\n  Reanudar sesión por su número en la lista\n\n" +
+			"/resume [página]\n  Elegir una sesión para reanudar de una lista pulsable\n\n" +
 			"/delete <número>|1,2,3|3-7|1,3-5,8\n  Eliminar una o varias sesiones por número de lista\n\n" +
 			"/name [número] <texto>\n  Nombrar una sesión para fácil identificación\n\n" +
 			"/current\n  Mostrar sesión activa actual\n\n" +
@@ -1265,6 +1271,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list — List agent sessions\n" +
 			"/search <keyword> — Search sessions\n" +
 			"/switch <number> — Resume a session\n" +
+			"/resume [page] — Pick a session from a tappable list\n" +
 			"/delete <number>|1,2,3|3-7|1,3-5,8 — Delete session(s)\n" +
 			"/name [number] <text> — Name a session\n" +
 			"/current — Show active session\n" +
@@ -1274,6 +1281,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list — 列出会话列表\n" +
 			"/search <关键词> — 搜索会话\n" +
 			"/switch <序号> — 切换会话\n" +
+			"/resume [页码] — 从可点击列表挑选会话\n" +
 			"/delete <序号>|1,2,3|3-7|1,3-5,8 — 删除会话\n" +
 			"/name [序号] <名称> — 命名会话\n" +
 			"/current — 查看当前会话\n" +
@@ -1283,6 +1291,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list — 列出會話列表\n" +
 			"/search <關鍵詞> — 搜尋會話\n" +
 			"/switch <序號> — 切換會話\n" +
+			"/resume [頁碼] — 從可點擊列表挑選會話\n" +
 			"/delete <序號>|1,2,3|3-7|1,3-5,8 — 刪除會話\n" +
 			"/name [序號] <名稱> — 命名會話\n" +
 			"/current — 查看當前會話\n" +
@@ -1292,6 +1301,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list — セッション一覧\n" +
 			"/search <キーワード> — セッション検索\n" +
 			"/switch <番号> — セッション切り替え\n" +
+			"/resume [ページ] — 一覧からセッションを選択\n" +
 			"/delete <番号>|1,2,3|3-7|1,3-5,8 — セッション削除\n" +
 			"/name [番号] <名前> — セッションに名前を付ける\n" +
 			"/current — 現在のセッションを表示\n" +
@@ -1301,6 +1311,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/list — Listar sesiones\n" +
 			"/search <keyword> — Buscar sesiones\n" +
 			"/switch <número> — Reanudar sesión\n" +
+			"/resume [página] — Elegir sesión de una lista pulsable\n" +
 			"/delete <número>|1,2,3|3-7|1,3-5,8 — Eliminar sesión(es)\n" +
 			"/name [número] <texto> — Nombrar sesión\n" +
 			"/current — Mostrar sesión activa\n" +
@@ -3626,6 +3637,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "按列表序號切換會話，參數: <序號>",
 		LangJapanese:           "リスト番号でセッションを切り替え、引数: <番号>",
 		LangSpanish:            "Reanudar sesión por su número en la lista, arg: <número>",
+	},
+	MsgBuiltinCmdResume: {
+		LangEnglish:            "Pick a session to resume, arg: [page]",
+		LangChinese:            "挑选要恢复的会话，参数: [页码]",
+		LangTraditionalChinese: "挑選要恢復的會話，參數: [頁碼]",
+		LangJapanese:           "再開するセッションを選択、引数: [ページ]",
+		LangSpanish:            "Elegir una sesión para reanudar, arg: [página]",
 	},
 	MsgBuiltinCmdDelete: {
 		LangEnglish:            "Delete session(s) by list number, args: <number> | 1,2,3 | 3-7 | 1,3-5,8",

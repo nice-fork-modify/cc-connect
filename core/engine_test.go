@@ -3405,6 +3405,150 @@ func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	}
 }
 
+func resumeTestSessions(n int) []AgentSessionInfo {
+	out := make([]AgentSessionInfo, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, AgentSessionInfo{
+			ID:           fmt.Sprintf("s%d", i),
+			Summary:      fmt.Sprintf("Session %d", i),
+			MessageCount: i,
+		})
+	}
+	return out
+}
+
+func TestCmdResume_ButtonPerSessionSwitchesByNumber(t *testing.T) {
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &stubListAgent{sessions: resumeTestSessions(3)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdResume(p, &Message{SessionKey: "tg:1", ReplyCtx: "ctx"}, nil)
+
+	if len(p.buttonRows) != 3 {
+		t.Fatalf("rows = %d, want one per session", len(p.buttonRows))
+	}
+	for i, row := range p.buttonRows {
+		if len(row) != 1 {
+			t.Fatalf("row %d has %d buttons, want 1", i, len(row))
+		}
+		want := fmt.Sprintf("cmd:/switch %d", i+1)
+		if row[0].Data != want {
+			t.Errorf("row %d data = %q, want %q", i, row[0].Data, want)
+		}
+		if !strings.Contains(row[0].Text, fmt.Sprintf("Session %d", i+1)) {
+			t.Errorf("row %d text = %q, want the session summary", i, row[0].Text)
+		}
+	}
+	// The body must stand on its own for platforms without buttons.
+	if !strings.Contains(p.buttonContent, "Session 2") {
+		t.Errorf("body should carry the numbered list, got %q", p.buttonContent)
+	}
+}
+
+func TestCmdResume_CallbackDataFitsTelegramLimit(t *testing.T) {
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &stubListAgent{sessions: resumeTestSessions(resumePageSize * 3)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdResume(p, &Message{SessionKey: "tg:1", ReplyCtx: "ctx"}, []string{"2"})
+
+	for _, row := range p.buttonRows {
+		for _, b := range row {
+			if len(b.Data) > 64 {
+				t.Errorf("callback data %q is %d bytes, Telegram allows 64", b.Data, len(b.Data))
+			}
+		}
+	}
+}
+
+func TestCmdResume_PaginatesAndNumbersAcrossPages(t *testing.T) {
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &stubListAgent{sessions: resumeTestSessions(resumePageSize + 2)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdResume(p, &Message{SessionKey: "tg:1", ReplyCtx: "ctx"}, []string{"2"})
+
+	// Page 2 holds the 2 leftovers plus a navigation row.
+	if len(p.buttonRows) != 3 {
+		t.Fatalf("rows = %d, want 2 sessions + 1 nav row", len(p.buttonRows))
+	}
+	want := fmt.Sprintf("cmd:/switch %d", resumePageSize+1)
+	if got := p.buttonRows[0][0].Data; got != want {
+		t.Errorf("first button on page 2 = %q, want %q (numbering is global)", got, want)
+	}
+}
+
+func TestCmdResume_MarksActiveSession(t *testing.T) {
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &stubListAgent{sessions: resumeTestSessions(2)}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.sessions.GetOrCreateActive("tg:1").SetAgentSessionID("s2", "stub")
+
+	e.cmdResume(p, &Message{SessionKey: "tg:1", ReplyCtx: "ctx"}, nil)
+
+	if strings.HasPrefix(p.buttonRows[0][0].Text, "▶") {
+		t.Errorf("session 1 is not active, got %q", p.buttonRows[0][0].Text)
+	}
+	if !strings.HasPrefix(p.buttonRows[1][0].Text, "▶") {
+		t.Errorf("session 2 is active and should be marked, got %q", p.buttonRows[1][0].Text)
+	}
+}
+
+func TestCmdResume_EmptyListSendsPlainMessage(t *testing.T) {
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubListAgent{}, []Platform{p}, "", LangEnglish)
+
+	e.cmdResume(p, &Message{SessionKey: "tg:1", ReplyCtx: "ctx"}, nil)
+
+	if len(p.buttonRows) != 0 {
+		t.Errorf("no sessions means no buttons, got %d rows", len(p.buttonRows))
+	}
+	if len(p.sent) == 0 {
+		t.Fatal("expected an empty-list reply")
+	}
+}
+
+func TestResumeNavRow(t *testing.T) {
+	if row := resumeNavRow(1, 1); row != nil {
+		t.Errorf("single page needs no nav row, got %v", row)
+	}
+	first := resumeNavRow(1, 3)
+	if len(first) != 1 || first[0].Data != "cmd:/resume 2" {
+		t.Errorf("first page = %v, want forward only", first)
+	}
+	mid := resumeNavRow(2, 3)
+	if len(mid) != 2 || mid[0].Data != "cmd:/resume 1" || mid[1].Data != "cmd:/resume 3" {
+		t.Errorf("middle page = %v, want both directions", mid)
+	}
+	last := resumeNavRow(3, 3)
+	if len(last) != 1 || last[0].Data != "cmd:/resume 2" {
+		t.Errorf("last page = %v, want back only", last)
+	}
+}
+
+func TestSessionDisplayName(t *testing.T) {
+	sm := NewSessionManager("")
+	sm.SetSessionName("named", "My Session")
+
+	tests := []struct {
+		name string
+		info AgentSessionInfo
+		want string
+	}{
+		{"custom name wins and is not truncated", AgentSessionInfo{ID: "named", Summary: "ignored"}, "📌 My Session"},
+		{"summary is collapsed to one line", AgentSessionInfo{ID: "a", Summary: "one\n  two"}, "one two"},
+		{"blank summary falls back", AgentSessionInfo{ID: "b", Summary: "   "}, "(empty)"},
+		{"long summary is truncated", AgentSessionInfo{ID: "c", Summary: strings.Repeat("x", 12)}, strings.Repeat("x", 10) + "…"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sessionDisplayName(tt.info, sm, 10); got != tt.want {
+				t.Errorf("sessionDisplayName = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandlePendingPermission_MultiWorkspaceLookup(t *testing.T) {
 	e := newTestEngine()
 

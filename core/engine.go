@@ -6929,6 +6929,7 @@ var builtinCommands = []struct {
 	{[]string{"new"}, "new"},
 	{[]string{"list", "sessions"}, "list"},
 	{[]string{"switch"}, "switch"},
+	{[]string{"resume"}, "resume"},
 	{[]string{"name", "rename"}, "name"},
 	{[]string{"current"}, "current"},
 	{[]string{"status"}, "status"},
@@ -7139,6 +7140,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdList(p, msg, args)
 	case "switch":
 		e.cmdSwitch(p, msg, args)
+	case "resume":
+		e.cmdResume(p, msg, args)
 	case "name":
 		e.cmdName(p, msg, args)
 	case "current":
@@ -7564,6 +7567,26 @@ func filterOwnedSessions(sessions []AgentSessionInfo, known map[string]struct{})
 
 const listPageSize = 20
 
+// listNameMaxRunes caps a session label in /list output.
+const listNameMaxRunes = 40
+
+// sessionDisplayName returns the label for a session in list output: the custom
+// name set via /name when there is one, otherwise the agent's summary collapsed
+// to a single line and truncated to maxRunes.
+func sessionDisplayName(s AgentSessionInfo, sessions *SessionManager, maxRunes int) string {
+	if name := sessions.GetSessionName(s.ID); name != "" {
+		return "📌 " + name
+	}
+	name := strings.Join(strings.Fields(strings.ReplaceAll(s.Summary, "\n", " ")), " ")
+	if name == "" {
+		return "(empty)"
+	}
+	if len([]rune(name)) > maxRunes {
+		return string([]rune(name)[:maxRunes]) + "…"
+	}
+	return name
+}
+
 // dirCardPageSize is the max directory history rows per card page (Feishu / other card UIs).
 const dirCardPageSize = 20
 
@@ -7621,21 +7644,9 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 			if s.ID == activeAgentID {
 				marker = "▶"
 			}
-			displayName := sessions.GetSessionName(s.ID)
-			if displayName != "" {
-				displayName = "📌 " + displayName
-			} else {
-				displayName = strings.ReplaceAll(s.Summary, "\n", " ")
-				displayName = strings.Join(strings.Fields(displayName), " ")
-				if displayName == "" {
-					displayName = "(empty)"
-				}
-				if len([]rune(displayName)) > 40 {
-					displayName = string([]rune(displayName)[:40]) + "…"
-				}
-			}
 			sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
-				marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
+				marker, i+1, sessionDisplayName(s, sessions, listNameMaxRunes),
+				s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
 		}
 		if totalPages > 1 {
 			sb.WriteString(fmt.Sprintf(e.i18n.T(MsgListPageHint), page, totalPages))
@@ -7707,6 +7718,110 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	}
 	e.reply(p, msg.ReplyCtx,
 		e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount))
+}
+
+// resumePageSize is deliberately smaller than listPageSize: /resume renders one
+// tappable button per session, and a 20-button keyboard is unusable on a phone.
+const resumePageSize = 8
+
+// resumeNameMaxRunes keeps a button label short enough to stay readable in a
+// Telegram inline keyboard, which is narrower than a message body.
+const resumeNameMaxRunes = 24
+
+// cmdResume mirrors `claude --resume`: it lists the agent's sessions and lets
+// the user pick one to continue. Platforms that support inline buttons render
+// one button per session, so picking is a single tap; elsewhere
+// replyWithButtons falls back to the message body, which carries the same
+// numbered list that /list produces.
+func (e *Engine) cmdResume(p Platform, msg *Message, args []string) {
+	agent, sessions, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
+		return
+	}
+	agentSessions = e.applySessionFilter(agentSessions, sessions)
+	if len(agentSessions) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
+		return
+	}
+
+	total := len(agentSessions)
+	totalPages := (total + resumePageSize - 1) / resumePageSize
+	page := 1
+	if len(args) > 0 {
+		if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * resumePageSize
+	end := start + resumePageSize
+	if end > total {
+		end = total
+	}
+
+	activeAgentID := sessions.GetOrCreateActive(msg.SessionKey).GetAgentSessionID()
+
+	var sb strings.Builder
+	if totalPages > 1 {
+		sb.WriteString(fmt.Sprintf(e.i18n.T(MsgListTitlePaged), agent.Name(), total, page, totalPages))
+	} else {
+		sb.WriteString(fmt.Sprintf(e.i18n.T(MsgListTitle), agent.Name(), total))
+	}
+
+	var rows [][]ButtonOption
+	for i := start; i < end; i++ {
+		s := agentSessions[i]
+		marker := "◻"
+		if s.ID == activeAgentID {
+			marker = "▶"
+		}
+		sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
+			marker, i+1, sessionDisplayName(s, sessions, listNameMaxRunes),
+			s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
+		// The list number, not the session ID, keeps the callback payload well
+		// inside Telegram's 64-byte limit and reuses matchSession's index
+		// lookup, so the button does exactly what typing /switch <n> does.
+		rows = append(rows, []ButtonOption{{
+			Text: fmt.Sprintf("%s %d. %s", marker, i+1,
+				sessionDisplayName(s, sessions, resumeNameMaxRunes)),
+			Data: fmt.Sprintf("cmd:/switch %d", i+1),
+		}})
+	}
+	if nav := resumeNavRow(page, totalPages); len(nav) > 0 {
+		rows = append(rows, nav)
+	}
+	sb.WriteString(e.i18n.T(MsgListSwitchHint))
+
+	e.replyWithButtons(p, msg.ReplyCtx, sb.String(), rows)
+}
+
+// resumeNavRow builds the page navigation row for /resume, or nil when
+// everything fits on one page. The arrows differ from the "▶" active-session
+// marker so the two are not confused.
+func resumeNavRow(page, totalPages int) []ButtonOption {
+	if totalPages <= 1 {
+		return nil
+	}
+	var row []ButtonOption
+	if page > 1 {
+		row = append(row, ButtonOption{
+			Text: "⬅️", Data: fmt.Sprintf("cmd:/resume %d", page-1),
+		})
+	}
+	if page < totalPages {
+		row = append(row, ButtonOption{
+			Text: "➡️", Data: fmt.Sprintf("cmd:/resume %d", page+1),
+		})
+	}
+	return row
 }
 
 // matchSession resolves a user query to an agent session. Priority:

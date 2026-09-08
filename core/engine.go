@@ -8398,45 +8398,21 @@ func replyFooterWorkDir(session AgentSession, agent Agent, workspaceDir string) 
 	return compactReplyFooterPath(dir)
 }
 
+// compactReplyFooterPath renders the footer's workspace path as its last two
+// segments — /Workspace/Ai/Hermes/cc-connect/work-dir/link-comming becomes
+// work-dir/link-comming. Paths already that short are returned as they are,
+// keeping the leading separator.
 func compactReplyFooterPath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
 	}
-	cleaned := filepath.Clean(path)
-	normalized := normalizeWorkspacePath(cleaned)
-	if home, err := os.UserHomeDir(); err == nil {
-		homeCleaned := filepath.Clean(home)
-		homeNormalized := normalizeWorkspacePath(homeCleaned)
-		for _, candidate := range []struct {
-			path string
-			home string
-		}{
-			{cleaned, homeCleaned},
-			{normalized, homeNormalized},
-			{cleaned, homeNormalized},
-			{normalized, homeCleaned},
-		} {
-			if display, ok := replyFooterHomeRelativePath(candidate.path, candidate.home); ok {
-				return display
-			}
-		}
+	normalized := filepath.ToSlash(normalizeWorkspacePath(filepath.Clean(path)))
+	segs := strings.Split(strings.Trim(normalized, "/"), "/")
+	if len(segs) <= 2 {
+		return normalized
 	}
-	return filepath.ToSlash(normalized)
-}
-
-func replyFooterHomeRelativePath(path, home string) (string, bool) {
-	if path == "" || home == "" {
-		return "", false
-	}
-	if path == home {
-		return "~", true
-	}
-	prefix := home + string(os.PathSeparator)
-	if strings.HasPrefix(path, prefix) {
-		return "~" + filepath.ToSlash(strings.TrimPrefix(path, home)), true
-	}
-	return "", false
+	return strings.Join(segs[len(segs)-2:], "/")
 }
 
 // buildClaudeStatusLineFooter renders a CCD-statusline-style footer for the

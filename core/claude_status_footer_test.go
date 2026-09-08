@@ -256,18 +256,36 @@ func TestBuildReplyFooter_LegacyAllSegments(t *testing.T) {
 	}
 }
 
-func TestCompactReplyFooterPath_HomeRelativeDeepPathStaysFull(t *testing.T) {
+func TestCompactReplyFooterPath_KeepsLastTwoSegments(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 
 	shortPath := filepath.Join(homeDir, "codes", "cc-connect")
-	if got, want := compactReplyFooterPath(shortPath), "~/codes/cc-connect"; got != want {
+	if got, want := compactReplyFooterPath(shortPath), "codes/cc-connect"; got != want {
 		t.Fatalf("short home path = %q, want %q", got, want)
 	}
 
 	deepPath := filepath.Join(homeDir, "code", "TechStudio", "projects", "core", "agents", "ceo")
-	if got, want := compactReplyFooterPath(deepPath), "~/code/TechStudio/projects/core/agents/ceo"; got != want {
+	if got, want := compactReplyFooterPath(deepPath), "agents/ceo"; got != want {
 		t.Fatalf("deep home path = %q, want %q", got, want)
+	}
+}
+
+func TestCompactReplyFooterPath_ShortPathKeepsLeadingSlash(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"", ""},
+		{"/", "/"},
+		{"/nonexistent-root", "/nonexistent-root"},
+		{"/nonexistent-root/ws", "/nonexistent-root/ws"},
+		{"/Workspace/Ai/Hermes/cc-connect/work-dir/link-comming", "work-dir/link-comming"},
+	}
+	for _, tt := range tests {
+		if got := compactReplyFooterPath(tt.path); got != tt.want {
+			t.Errorf("compactReplyFooterPath(%q) = %q, want %q", tt.path, got, tt.want)
+		}
 	}
 }
 

@@ -782,6 +782,15 @@ name = "my-backend"
 # inject_sender：为 true 时，转发给 agent 的每条消息前会加一行发送者标识，
 # 让 agent 在群聊里区分不同用户；平台没有提供昵称时不带 sender_name。默认 false。
 #
+# skill_discovered: when true, scan the agent's skill directories for SKILL.md
+# and publish each skill as a slash command (/skills, platform command menu).
+# Default false = no scan at all. The agent CLI finds its own skills either way,
+# so leaving this off only removes the chat-side shortcuts.
+# skill_discovered = false
+# skill_discovered：为 true 时扫描 agent 的 skill 目录，把每个 SKILL.md 注册成
+# 斜杠命令（/skills 与平台命令菜单）。默认 false = 完全不扫描。agent CLI 自己的
+# skill 发现不受影响，关掉只是没有聊天侧的快捷入口。
+#
 # shell = "/bin/fish"                        # Per-project shell override / 项目级 shell 覆盖
 # shell_profile = "source ~/.config/fish/config.fish"  # Per-project shell profile / 项目级 shell profile
 #

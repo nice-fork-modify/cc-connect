@@ -734,6 +734,9 @@ func main() {
 			engine.SetInjectSender(*proj.InjectSender)
 		}
 
+		// Skill discovery is opt-in: unset means no SKILL.md scan at all.
+		engine.SetSkillDiscovery(proj.SkillDiscovered != nil && *proj.SkillDiscovered)
+
 		// Wire speech-to-text if enabled
 		if cfg.Speech.Enabled {
 			speechCfg := core.SpeechCfg{

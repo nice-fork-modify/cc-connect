@@ -532,8 +532,12 @@ type ProjectConfig struct {
 	ShowWorkdirIndicator *bool `toml:"show_workdir_indicator,omitempty"`
 	// ReplyFooter: nil/true = render the reply footer; false = disable it
 	// entirely (the per-line indicator flags above become no-ops).
-	ReplyFooter      *bool        `toml:"reply_footer,omitempty"`
-	InjectSender     *bool        `toml:"inject_sender,omitempty"`     // prepend sender identity (platform + user ID) to each message sent to the agent
+	ReplyFooter  *bool `toml:"reply_footer,omitempty"`
+	InjectSender *bool `toml:"inject_sender,omitempty"` // prepend sender identity (platform + user ID) to each message sent to the agent
+	// SkillDiscovered: nil/false = do not scan for SKILL.md at all, so no skill
+	// is published as a cc-connect slash command; true = scan the agent's skill
+	// directories. The agent CLI discovers its own skills either way.
+	SkillDiscovered  *bool        `toml:"skill_discovered,omitempty"`
 	EnabledCommands  []string     `toml:"enabled_commands,omitempty"`  // when non-empty, only these command names work; "*" = no restriction
 	DisabledCommands []string     `toml:"disabled_commands,omitempty"` // command names to disable, matched exactly as typed (e.g. ["restart", "sh"]); "*" = all
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users

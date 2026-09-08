@@ -200,6 +200,52 @@ func TestSkillRegistryListAll_IgnoresRootSkillFile(t *testing.T) {
 	}
 }
 
+// skillProviderAgent is a stubAgent that also advertises a skill directory,
+// so SetSkillDiscovery has something to scan when it is turned back on.
+type skillProviderAgent struct {
+	stubAgent
+	dirs []string
+}
+
+func (a *skillProviderAgent) SkillDirs() []string { return a.dirs }
+
+func TestEngine_SetSkillDiscovery(t *testing.T) {
+	root := t.TempDir()
+	writeSkillFile(t, filepath.Join(root, "deploy", "SKILL.md"), "Deploy skill")
+
+	agent := &skillProviderAgent{dirs: []string{root}}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+
+	// NewEngine wires the agent's dirs; main.go decides afterwards.
+	if len(e.ListSkills()) != 1 {
+		t.Fatalf("skills before opting out = %d, want 1", len(e.ListSkills()))
+	}
+
+	e.SetSkillDiscovery(false)
+	if got := e.SkillDirs(); len(got) != 0 {
+		t.Errorf("skill dirs after disabling = %v, want none", got)
+	}
+	if got := e.ListSkills(); len(got) != 0 {
+		t.Errorf("skills after disabling = %d, want 0", len(got))
+	}
+
+	e.SetSkillDiscovery(true)
+	if got := e.ListSkills(); len(got) != 1 {
+		t.Errorf("skills after re-enabling = %d, want 1", len(got))
+	}
+}
+
+func TestEngine_SetSkillDiscoveryOnAgentWithoutSkills(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+
+	// An agent that is not a SkillProvider must not panic on either setting.
+	e.SetSkillDiscovery(false)
+	e.SetSkillDiscovery(true)
+	if got := e.ListSkills(); len(got) != 0 {
+		t.Errorf("skills = %d, want 0", len(got))
+	}
+}
+
 func writeSkillFile(t *testing.T, path, description string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

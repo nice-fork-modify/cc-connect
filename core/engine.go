@@ -1711,6 +1711,22 @@ func (e *Engine) SkillDirs() []string {
 	return e.skills.Dirs()
 }
 
+// SetSkillDiscovery turns SKILL.md discovery on or off for this project.
+//
+// Disabling clears the scan roots, so nothing is read from disk and no skill
+// reaches /skills or the platform command menu. Scanning is only worth its
+// cost when the skills are meant to be triggered from chat — the agent CLI
+// finds its own skills regardless of this setting.
+func (e *Engine) SetSkillDiscovery(enabled bool) {
+	if !enabled {
+		e.skills.SetDirs(nil)
+		return
+	}
+	if sp, ok := e.agent.(SkillProvider); ok {
+		e.skills.SetDirs(sp.SkillDirs())
+	}
+}
+
 // AgentTypeName returns the agent type name (e.g. "claudecode", "codex").
 func (e *Engine) AgentTypeName() string {
 	if e.agent != nil {

@@ -4436,11 +4436,18 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		}
 	}
 
-	// Create per-workspace session manager
-	h := sha256.Sum256([]byte(workspace))
-	sessionFile := filepath.Join(filepath.Dir(e.sessions.StorePath()),
-		fmt.Sprintf("%s_ws_%s.json", e.name, hex.EncodeToString(h[:4])))
-	sessions := NewSessionManager(sessionFile)
+	// Create per-workspace session manager. An engine without a session store
+	// keeps its sessions in memory, so the per-workspace managers must do the
+	// same — deriving a path from an empty StorePath yields "." as the
+	// directory and scatters test_ws_*.json files across the working directory.
+	var sessions *SessionManager
+	if storePath := e.sessions.StorePath(); storePath == "" {
+		sessions = NewSessionManager("")
+	} else {
+		h := sha256.Sum256([]byte(workspace))
+		sessions = NewSessionManager(filepath.Join(filepath.Dir(storePath),
+			fmt.Sprintf("%s_ws_%s.json", e.name, hex.EncodeToString(h[:4]))))
+	}
 
 	ws.agent = agent
 	ws.sessions = sessions

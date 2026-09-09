@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -801,5 +803,73 @@ func TestLookupEffectiveBinding_NoIsolationUnbindsMissing(t *testing.T) {
 	}
 	if got := e.workspaceBindings.Lookup("project:test", channelKey); got != nil {
 		t.Errorf("expected missing workspace binding to be unbound without isolation, got %+v", got)
+	}
+}
+
+// TestGetOrCreateWorkspaceAgent_NoStorePathStaysInMemory guards against the
+// per-workspace session manager writing to disk when the engine itself has no
+// session store. Deriving the path from an empty StorePath made filepath.Dir
+// return ".", so every run littered the package directory with
+// test_ws_<hash>.json files.
+func TestGetOrCreateWorkspaceAgent_NoStorePathStaysInMemory(t *testing.T) {
+	baseDir := t.TempDir()
+	workspaceDir := normalizeWorkspacePath(baseDir)
+
+	agentName := "no-store-path-test-agent"
+	RegisterAgent(agentName, func(opts map[string]any) (Agent, error) {
+		return &namedTestAgent{name: agentName}, nil
+	})
+
+	e := NewEngine("test", &namedTestAgent{name: agentName}, nil, "", LangEnglish)
+	e.SetMultiWorkspace(baseDir, filepath.Join(t.TempDir(), "bindings.json"))
+
+	_, sessions, err := e.getOrCreateWorkspaceAgent(workspaceDir)
+	if err != nil {
+		t.Fatalf("getOrCreateWorkspaceAgent: %v", err)
+	}
+	if got := sessions.StorePath(); got != "" {
+		t.Errorf("workspace store path = %q, want empty so nothing is persisted", got)
+	}
+
+	// Saving must be a no-op rather than creating a file in the working directory.
+	sessions.Save()
+	strays, err := filepath.Glob("test_ws_*.json")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(strays) > 0 {
+		t.Errorf("session files leaked into the working directory: %v", strays)
+	}
+}
+
+// TestGetOrCreateWorkspaceAgent_DerivesStorePathFromEngine keeps the normal
+// case working: with a real store, each workspace gets its own file next to it.
+func TestGetOrCreateWorkspaceAgent_DerivesStorePathFromEngine(t *testing.T) {
+	baseDir := t.TempDir()
+	workspaceDir := normalizeWorkspacePath(baseDir)
+	storeDir := t.TempDir()
+
+	agentName := "derived-store-path-test-agent"
+	RegisterAgent(agentName, func(opts map[string]any) (Agent, error) {
+		return &namedTestAgent{name: agentName}, nil
+	})
+
+	e := NewEngine("test", &namedTestAgent{name: agentName}, nil,
+		filepath.Join(storeDir, "sessions.json"), LangEnglish)
+	e.SetMultiWorkspace(baseDir, filepath.Join(t.TempDir(), "bindings.json"))
+
+	_, sessions, err := e.getOrCreateWorkspaceAgent(workspaceDir)
+	if err != nil {
+		t.Fatalf("getOrCreateWorkspaceAgent: %v", err)
+	}
+
+	got := sessions.StorePath()
+	if filepath.Dir(got) != storeDir {
+		t.Errorf("workspace store dir = %q, want %q", filepath.Dir(got), storeDir)
+	}
+	h := sha256.Sum256([]byte(workspaceDir))
+	want := fmt.Sprintf("test_ws_%s.json", hex.EncodeToString(h[:4]))
+	if filepath.Base(got) != want {
+		t.Errorf("workspace store file = %q, want %q", filepath.Base(got), want)
 	}
 }

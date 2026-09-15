@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"strings"
 	"sync/atomic"
 )
 
@@ -35,6 +36,21 @@ func (e *Engine) currentTurnTag(state *interactiveState, icon string) string {
 	seq := state.currentTurnSeq
 	state.mu.Unlock()
 	return e.turnTag(seq, icon)
+}
+
+// startingNotice composes the "processing" notice that opens a turn's anchor
+// message. A custom text is used verbatim. The default i18n text already leads
+// with the working icon, which the turn marker also carries, so that duplicate
+// is dropped whenever a marker is present.
+func (e *Engine) startingNotice(tag, custom string) string {
+	if custom != "" {
+		return tag + custom
+	}
+	text := e.i18n.T(MsgStarting)
+	if tag != "" {
+		text = strings.TrimPrefix(text, turnIconWorking+" ")
+	}
+	return tag + text
 }
 
 // turnTagHolder carries the turn marker that the stream preview injects into

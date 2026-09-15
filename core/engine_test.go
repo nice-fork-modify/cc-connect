@@ -14507,8 +14507,13 @@ func TestHandleMessage_InstantReply_UsesDefaultI18nWhenContentEmpty(t *testing.T
 	}
 
 	sent := p.getSent()
-	if sent[0] != "[#1 ⏳] ⏳ 处理中..." {
-		t.Fatalf("first reply = %q, want i18n default '⏳ 处理中...'", sent[0])
+	// The turn marker already carries the working icon, so startingNotice drops
+	// the duplicate one the i18n default leads with.
+	if sent[0] != "[#1 ⏳] 处理中..." {
+		t.Fatalf("first reply = %q, want i18n default without the duplicate icon", sent[0])
+	}
+	if strings.Contains(sent[0], "⏳ ⏳") {
+		t.Fatalf("first reply = %q, want the duplicate working icon dropped", sent[0])
 	}
 }
 

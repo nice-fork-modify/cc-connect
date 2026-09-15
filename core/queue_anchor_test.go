@@ -158,7 +158,9 @@ func TestQueueAnchor_AckBecomesFinalAnswer(t *testing.T) {
 	// then → the final answer.
 	updates := p.getUpdates()
 	want := []anchorUpdate{
-		{Handle: ackHandle, Content: "[#2 ⏳] " + e.i18n.T(MsgStarting)},
+		// The marker carries the working icon, so the i18n default's own leading
+		// icon is dropped (see Engine.startingNotice).
+		{Handle: ackHandle, Content: "[#2 ⏳] Processing..."},
 		{Handle: ackHandle, Content: "[#2 ✅] response2"},
 	}
 	if len(updates) != len(want) {
@@ -218,7 +220,9 @@ func TestQueueAnchor_AdoptedAckFlipsToWorking(t *testing.T) {
 
 	updates := p.getUpdates()
 	want := []anchorUpdate{
-		{Handle: "ack-1", Content: "[#2 ⏳] " + e.i18n.T(MsgStarting)},
+		// The marker carries the working icon, so the i18n default's own leading
+		// icon is dropped (see Engine.startingNotice).
+		{Handle: "ack-1", Content: "[#2 ⏳] Processing..."},
 		{Handle: "ack-1", Content: "[#2 ✅] response2"},
 	}
 	if len(updates) != len(want) {

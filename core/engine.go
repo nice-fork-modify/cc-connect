@@ -5663,11 +5663,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	// Both go through a single showNotice call so the message is edited once.
 	instantNotice := e.instantReply.Enabled && streamCard == nil
 	if instantNotice || turnAnchor != nil {
-		replyContent := e.i18n.T(MsgStarting)
-		if instantNotice && e.instantReply.Content != "" {
-			replyContent = e.instantReply.Content
+		custom := ""
+		if instantNotice {
+			custom = e.instantReply.Content
 		}
-		notice := e.turnTag(turnSeq, turnIconWorking) + replyContent
+		notice := e.startingNotice(e.turnTag(turnSeq, turnIconWorking), custom)
 		// Prefer the turn's preview message so the notice, the streamed text and
 		// the final answer are one message; fall back to a separate message only
 		// for the instant reply, never for the anchor flip.
@@ -6935,11 +6935,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// this turn is already running. See the same block above.
 				queuedInstantNotice := e.instantReply.Enabled && streamCard == nil
 				if queuedInstantNotice || queued.ackHandle != nil {
-					replyContent := e.i18n.T(MsgStarting)
-					if queuedInstantNotice && e.instantReply.Content != "" {
-						replyContent = e.instantReply.Content
+					custom := ""
+					if queuedInstantNotice {
+						custom = e.instantReply.Content
 					}
-					notice := e.turnTag(turnSeq, turnIconWorking) + replyContent
+					notice := e.startingNotice(e.turnTag(turnSeq, turnIconWorking), custom)
 					if !sp.showNotice(notice) && queuedInstantNotice {
 						e.send(queued.platform, queued.replyCtx, notice)
 					}

@@ -14,6 +14,8 @@ const (
 	turnIconAwaiting = "❓" // waiting for the user (permission / AskUserQuestion)
 	turnIconFailed   = "❌" // the turn ended with an error
 	turnIconStopped  = "⏹" // the turn was aborted by /stop
+	turnIconImage    = "🖼" // a side-channel image belonging to the turn
+	turnIconFile     = "📎" // a side-channel file belonging to the turn
 )
 
 // turnTag renders a turn marker like "[#3 ⏳] " for correlating bot output
@@ -51,6 +53,15 @@ func (e *Engine) startingNotice(tag, custom string) string {
 		text = strings.TrimPrefix(text, turnIconWorking+" ")
 	}
 	return tag + text
+}
+
+// attachmentCaption renders the caption stamped onto a side-channel attachment
+// (an image or file the agent pushes mid-turn via `cc-connect send`) so it can
+// be traced back to the user message that triggered the turn, the same way text
+// output is. Returns "" when no turn is in flight — a proactive or scheduled
+// send belongs to no turn and must not borrow another turn's number.
+func (e *Engine) attachmentCaption(state *interactiveState, icon string) string {
+	return strings.TrimRight(e.currentTurnTag(state, icon), " ")
 }
 
 // turnTagHolder carries the turn marker that the stream preview injects into

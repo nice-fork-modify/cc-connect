@@ -5642,6 +5642,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	// in the MinDeltaChars / dedupe accounting.
 	previewTag := &turnTagHolder{}
 	previewTag.set(e.turnTag(turnSeq, turnIconWorking))
+	// flushTextSegment delivers an accumulated text segment as its own
+	// message(s) when the stream preview cannot host it — most commonly because
+	// an earlier segment boundary in this same turn already froze and detached
+	// the preview, leaving it degraded for the rest of the turn. The turn marker
+	// goes on the first chunk so those mid-turn segments stay traceable to the
+	// triggering message, exactly like the preview and the final answer.
+	// p/replyCtx are parameters rather than captured because both are reassigned
+	// when the turn switches to a queued message.
+	flushTextSegment := func(p Platform, replyCtx any, segment string) {
+		if segment == "" {
+			return
+		}
+		for _, chunk := range SplitMessageCodeFenceAware(previewTag.get()+segment, maxPlatformMessageLen) {
+			sendWorkspace(p, replyCtx, chunk)
+		}
+	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, previewTag.prefixRenderer(workspaceRenderer))
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	// A queued message hands its ack message over here; the preview then edits
@@ -5906,12 +5922,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						sp.freeze()
 						sp.detachPreview()
 					} else {
-						segment := strings.Join(textParts[segmentStart:], "")
-						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
-								sendWorkspace(p, replyCtx, chunk)
-							}
-						}
+						flushTextSegment(p, replyCtx, strings.Join(textParts[segmentStart:], ""))
 					}
 					segmentStart = len(textParts)
 				}
@@ -5929,12 +5940,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				previewActive := sp.canPreview()
 				if len(textParts) > segmentStart {
 					if !previewActive {
-						segment := strings.Join(textParts[segmentStart:], "")
-						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
-								sendWorkspace(p, replyCtx, chunk)
-							}
-						}
+						flushTextSegment(p, replyCtx, strings.Join(textParts[segmentStart:], ""))
 					}
 					segmentStart = len(textParts)
 					silentHold = false
@@ -5993,12 +5999,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						sp.freeze()
 						sp.detachPreview()
 					} else {
-						segment := strings.Join(textParts[segmentStart:], "")
-						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
-								sendWorkspace(p, replyCtx, chunk)
-							}
-						}
+						flushTextSegment(p, replyCtx, strings.Join(textParts[segmentStart:], ""))
 					}
 					segmentStart = len(textParts)
 				}
@@ -6037,12 +6038,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				previewActive := sp.canPreview()
 				if len(textParts) > segmentStart {
 					if !previewActive {
-						segment := strings.Join(textParts[segmentStart:], "")
-						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
-								sendWorkspace(p, replyCtx, chunk)
-							}
-						}
+						flushTextSegment(p, replyCtx, strings.Join(textParts[segmentStart:], ""))
 					}
 					segmentStart = len(textParts)
 					silentHold = false
@@ -6289,12 +6285,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			previewActive := sp.canPreview()
 			if len(textParts) > segmentStart {
 				if !previewActive {
-					segment := strings.Join(textParts[segmentStart:], "")
-					if segment != "" {
-						for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
-							sendWorkspace(p, replyCtx, chunk)
-						}
-					}
+					flushTextSegment(p, replyCtx, strings.Join(textParts[segmentStart:], ""))
 				}
 				segmentStart = len(textParts)
 				silentHold = false
@@ -12158,10 +12149,13 @@ func (e *Engine) SendToSessionWithOptions(sessionKey, message string, images []I
 			state.mu.Unlock()
 		}
 	}
+	imageCaption := e.attachmentCaption(state, turnIconImage)
+	fileCaption := e.attachmentCaption(state, turnIconFile)
 	for _, img := range images {
 		if err := e.waitOutgoing(p); err != nil {
 			return err
 		}
+		img.Caption = imageCaption // loop copy; the caller's slice is untouched
 		if err := imageSender.SendImage(e.ctx, replyCtx, img); err != nil {
 			return err
 		}
@@ -12170,6 +12164,7 @@ func (e *Engine) SendToSessionWithOptions(sessionKey, message string, images []I
 		if err := e.waitOutgoing(p); err != nil {
 			return err
 		}
+		file.Caption = fileCaption
 		if err := fileSender.SendFile(e.ctx, replyCtx, file); err != nil {
 			return err
 		}
@@ -12252,10 +12247,13 @@ func (e *Engine) SendToSessionInWorkDir(sessionKey, message string, images []Ima
 			target.state.mu.Unlock()
 		}
 	}
+	imageCaption := e.attachmentCaption(target.state, turnIconImage)
+	fileCaption := e.attachmentCaption(target.state, turnIconFile)
 	for _, img := range images {
 		if err := e.waitOutgoing(target.platform); err != nil {
 			return err
 		}
+		img.Caption = imageCaption // loop copy; the caller's slice is untouched
 		if err := imageSender.SendImage(e.ctx, target.replyCtx, img); err != nil {
 			return err
 		}
@@ -12264,6 +12262,7 @@ func (e *Engine) SendToSessionInWorkDir(sessionKey, message string, images []Ima
 		if err := e.waitOutgoing(target.platform); err != nil {
 			return err
 		}
+		file.Caption = fileCaption
 		if err := fileSender.SendFile(e.ctx, target.replyCtx, file); err != nil {
 			return err
 		}

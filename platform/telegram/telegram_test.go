@@ -83,8 +83,10 @@ type stubTelegramBot struct {
 	getFileCalls         int
 	setReactionCalls     int
 
-	lastSendMessageParams *tgbot.SendMessageParams
-	lastReactionParams    *tgbot.SetMessageReactionParams
+	lastSendMessageParams  *tgbot.SendMessageParams
+	lastReactionParams     *tgbot.SetMessageReactionParams
+	lastSendPhotoParams    *tgbot.SendPhotoParams
+	lastSendDocumentParams *tgbot.SendDocumentParams
 
 	sendErr    error
 	getFileErr error
@@ -108,9 +110,10 @@ func (b *stubTelegramBot) SendMessage(_ context.Context, params *tgbot.SendMessa
 	return &models.Message{ID: 99}, nil
 }
 
-func (b *stubTelegramBot) SendPhoto(_ context.Context, _ *tgbot.SendPhotoParams) (*models.Message, error) {
+func (b *stubTelegramBot) SendPhoto(_ context.Context, params *tgbot.SendPhotoParams) (*models.Message, error) {
 	b.mu.Lock()
 	b.sendPhotoCalls++
+	b.lastSendPhotoParams = params
 	b.mu.Unlock()
 	if b.sendErr != nil {
 		return nil, b.sendErr
@@ -118,9 +121,10 @@ func (b *stubTelegramBot) SendPhoto(_ context.Context, _ *tgbot.SendPhotoParams)
 	return &models.Message{ID: 99}, nil
 }
 
-func (b *stubTelegramBot) SendDocument(_ context.Context, _ *tgbot.SendDocumentParams) (*models.Message, error) {
+func (b *stubTelegramBot) SendDocument(_ context.Context, params *tgbot.SendDocumentParams) (*models.Message, error) {
 	b.mu.Lock()
 	b.sendDocumentCalls++
+	b.lastSendDocumentParams = params
 	b.mu.Unlock()
 	if b.sendErr != nil {
 		return nil, b.sendErr
@@ -221,6 +225,18 @@ func (b *stubTelegramBot) LastSendMessageParams() *tgbot.SendMessageParams {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.lastSendMessageParams
+}
+
+func (b *stubTelegramBot) LastSendPhotoParams() *tgbot.SendPhotoParams {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastSendPhotoParams
+}
+
+func (b *stubTelegramBot) LastSendDocumentParams() *tgbot.SendDocumentParams {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastSendDocumentParams
 }
 
 func (b *stubTelegramBot) SetReactionCallCount() int {
@@ -1220,4 +1236,77 @@ func TestIsTooLongErr(t *testing.T) {
 			t.Errorf("isTooLongErr(%q) = %v, want %v", tt.errMsg, got, tt.want)
 		}
 	}
+}
+
+// TestSendAttachment_CaptionAndReplyParameters covers side-channel attachments:
+// they are separate platform messages, so they need the same two correlation
+// signals the text path already has — the caption carries the turn marker the
+// engine stamped on, and the message quotes the triggering user message.
+func TestSendAttachment_CaptionAndReplyParameters(t *testing.T) {
+	t.Run("image", func(t *testing.T) {
+		stubBot := newStubTelegramBot()
+		p := &Platform{bot: stubBot}
+		rc := replyContext{chatID: 1, messageID: 42}
+
+		img := core.ImageAttachment{Data: []byte("png"), FileName: "chart.png", Caption: "[#4 🖼]"}
+		if err := p.SendImage(context.Background(), rc, img); err != nil {
+			t.Fatalf("SendImage: %v", err)
+		}
+
+		params := stubBot.LastSendPhotoParams()
+		if params == nil {
+			t.Fatal("SendPhoto was not called")
+		}
+		if params.Caption != "[#4 🖼]" {
+			t.Fatalf("Caption = %q, want %q", params.Caption, "[#4 🖼]")
+		}
+		if params.ReplyParameters == nil || params.ReplyParameters.MessageID != 42 {
+			t.Fatalf("ReplyParameters = %+v, want MessageID 42", params.ReplyParameters)
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		stubBot := newStubTelegramBot()
+		p := &Platform{bot: stubBot}
+		rc := replyContext{chatID: 1, messageID: 42}
+
+		file := core.FileAttachment{Data: []byte("doc"), FileName: "report.txt", Caption: "[#4 📎]"}
+		if err := p.SendFile(context.Background(), rc, file); err != nil {
+			t.Fatalf("SendFile: %v", err)
+		}
+
+		params := stubBot.LastSendDocumentParams()
+		if params == nil {
+			t.Fatal("SendDocument was not called")
+		}
+		if params.Caption != "[#4 📎]" {
+			t.Fatalf("Caption = %q, want %q", params.Caption, "[#4 📎]")
+		}
+		if params.ReplyParameters == nil || params.ReplyParameters.MessageID != 42 {
+			t.Fatalf("ReplyParameters = %+v, want MessageID 42", params.ReplyParameters)
+		}
+	})
+
+	// A proactive send has no triggering message: no quote, and the engine
+	// leaves the caption empty so no turn number is borrowed.
+	t.Run("no triggering message", func(t *testing.T) {
+		stubBot := newStubTelegramBot()
+		p := &Platform{bot: stubBot}
+		rc := replyContext{chatID: 1}
+
+		if err := p.SendImage(context.Background(), rc, core.ImageAttachment{Data: []byte("png")}); err != nil {
+			t.Fatalf("SendImage: %v", err)
+		}
+
+		params := stubBot.LastSendPhotoParams()
+		if params == nil {
+			t.Fatal("SendPhoto was not called")
+		}
+		if params.ReplyParameters != nil {
+			t.Fatalf("ReplyParameters = %+v, want nil", params.ReplyParameters)
+		}
+		if params.Caption != "" {
+			t.Fatalf("Caption = %q, want empty", params.Caption)
+		}
+	})
 }

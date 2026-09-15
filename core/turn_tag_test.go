@@ -402,3 +402,134 @@ func TestTurnTag_QueuedTurnNumbersAndDoneReaction(t *testing.T) {
 		t.Fatalf("done reaction contexts = %v, want [ctx-turn1 ctx-turn2]", ctxs)
 	}
 }
+
+// TestTurnTag_MidTurnSegmentsCarryMarker is the regression for mid-turn text
+// segments losing the turn marker.
+//
+// In compact mode the first tool call freezes and detaches the stream preview,
+// which leaves it degraded for the rest of the turn (unfreeze is only called
+// after a permission prompt). Every later segment is therefore delivered as a
+// plain message instead of a preview frame. Those plain messages must still
+// carry the marker: a turn that interleaves text and tool calls — the "explain,
+// generate an image, report" shape — otherwise emits unlabelled output that
+// cannot be traced back to the user message that triggered it.
+func TestTurnTag_MidTurnSegmentsCarryMarker(t *testing.T) {
+	p := &anchorPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newQueuingSession("qs-midturn")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	// compact: tool progress is hidden, so each tool call is purely a segment
+	// boundary and the only plain messages are the text segments themselves.
+	e.display.Mode = "compact"
+	e.display.ToolMessages = false
+	e.display.ThinkingMessages = false
+
+	key := "test:midturn-user"
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{
+		agentSession:   sess,
+		platform:       p,
+		replyCtx:       "ctx",
+		turnSeq:        4,
+		currentTurnSeq: 4,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	go func() {
+		// Segment one streams into the preview; the tool call then freezes and
+		// detaches it. Segment two has nowhere to stream to and is flushed as a
+		// plain message at the next tool boundary — this is the one that used to
+		// lose its marker. Segment three is the final answer.
+		sess.events <- Event{Type: EventText, Content: "segment one"}
+		sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "generate"}
+		sess.events <- Event{Type: EventText, Content: "segment two"}
+		sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "send-image"}
+		sess.events <- Event{Type: EventText, Content: "segment three"}
+		sess.events <- Event{Type: EventResult, Content: "segment three", Done: true}
+	}()
+
+	sendDone := make(chan error, 1)
+	sendDone <- nil
+
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "msg", time.Now(), nil, sendDone, "ctx")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("processInteractiveEvents did not complete in time")
+	}
+
+	sent := p.getSent()
+	if len(sent) != 2 {
+		t.Fatalf("plain sends = %v, want segment two + the final answer", sent)
+	}
+	if sent[0] != "[#4 ⏳] segment two" {
+		t.Fatalf("mid-turn segment = %q, want %q", sent[0], "[#4 ⏳] segment two")
+	}
+	if sent[1] != "[#4 ✅] segment three" {
+		t.Fatalf("final answer = %q, want %q", sent[1], "[#4 ✅] segment three")
+	}
+}
+
+// TestTurnTag_AttachmentsCarryMarker covers side-channel attachments: an image
+// or file the agent pushes mid-turn via `cc-connect send` is a separate platform
+// message, so without a marker it is the one piece of a turn's output that
+// cannot be traced back to the triggering user message.
+func TestTurnTag_AttachmentsCarryMarker(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform:       p,
+		replyCtx:       "ctx-1",
+		turnSeq:        4,
+		currentTurnSeq: 4, // turn #4 is in flight
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"",
+		[]ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"}},
+		[]FileAttachment{{MimeType: "text/plain", Data: []byte("doc"), FileName: "report.txt"}},
+		nil, false)
+	if err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	if len(p.images) != 1 || p.images[0].Caption != "[#4 🖼]" {
+		t.Fatalf("image caption = %#v, want %q", p.images, "[#4 🖼]")
+	}
+	if len(p.files) != 1 || p.files[0].Caption != "[#4 📎]" {
+		t.Fatalf("file caption = %#v, want %q", p.files, "[#4 📎]")
+	}
+}
+
+// TestTurnTag_ProactiveAttachmentGetsNoMarker is the other half of the contract:
+// a scheduled or proactive send belongs to no turn (currentTurnSeq is zeroed
+// when a turn ends), so it must not borrow the previous turn's number.
+func TestTurnTag_ProactiveAttachmentGetsNoMarker(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform:       p,
+		replyCtx:       "ctx-1",
+		turnSeq:        4, // four turns have run
+		currentTurnSeq: 0, // ...but none is in flight right now
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"",
+		[]ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"}},
+		nil, nil, false)
+	if err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+	if len(p.images) != 1 || p.images[0].Caption != "" {
+		t.Fatalf("image caption = %#v, want empty (no turn in flight)", p.images)
+	}
+}

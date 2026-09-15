@@ -1179,6 +1179,12 @@ func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttach
 		ChatID:          rc.chatID,
 		MessageThreadID: rc.threadID,
 		Photo:           &models.InputFileUpload{Filename: name, Data: bytes.NewReader(img.Data)},
+		Caption:         img.Caption,
+	}
+	// Quote the triggering message so the image is traceable to it, matching
+	// what Send and SendPreviewStart already do for text.
+	if rc.messageID != 0 {
+		params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
 	}
 	if _, err := bot.SendPhoto(ctx, params); err != nil {
 		return fmt.Errorf("telegram: send image: %w", err)
@@ -1204,6 +1210,10 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 		ChatID:          rc.chatID,
 		MessageThreadID: rc.threadID,
 		Document:        &models.InputFileUpload{Filename: name, Data: bytes.NewReader(file.Data)},
+		Caption:         file.Caption,
+	}
+	if rc.messageID != 0 {
+		params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
 	}
 	if _, err := bot.SendDocument(ctx, params); err != nil {
 		return fmt.Errorf("telegram: send file: %w", err)

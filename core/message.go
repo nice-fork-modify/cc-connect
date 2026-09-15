@@ -97,6 +97,11 @@ type ImageAttachment struct {
 	MimeType string // e.g. "image/png", "image/jpeg"
 	Data     []byte // raw image bytes
 	FileName string // original filename (optional)
+	// Caption is outbound-only: text the platform renders alongside the image.
+	// The engine uses it to stamp the turn marker on attachments it pushes, and
+	// it is always empty on inbound attachments. Platforms without caption
+	// support ignore it.
+	Caption string
 }
 
 // FileAttachment represents a file (PDF, doc, spreadsheet, etc.) sent by the user.
@@ -104,6 +109,8 @@ type FileAttachment struct {
 	MimeType string // e.g. "application/pdf", "text/plain"
 	Data     []byte // raw file bytes
 	FileName string // original filename
+	// Caption is outbound-only; see ImageAttachment.Caption.
+	Caption string
 }
 
 // SaveFilesToDisk saves file attachments to disk and returns the list of

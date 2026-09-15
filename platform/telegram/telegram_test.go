@@ -1187,14 +1187,20 @@ func TestNewDoneEmojiOption(t *testing.T) {
 	if tg.doneEmoji != "👌" {
 		t.Fatalf("default doneEmoji = %q, want %q", tg.doneEmoji, "👌")
 	}
+	if !tg.enableReactions {
+		t.Fatal("default enableReactions = false, want true")
+	}
 
-	p2, err := New(map[string]any{"token": "test-token", "done_emoji": "none"})
+	p2, err := New(map[string]any{"token": "test-token", "done_emoji": "none", "enable_reactions": false})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	tg2 := p2.(*Platform)
 	if tg2.doneEmoji != "" {
 		t.Fatalf("doneEmoji = %q, want empty when done_emoji=none", tg2.doneEmoji)
+	}
+	if tg2.enableReactions {
+		t.Fatal("enableReactions = true, want false when enable_reactions=false")
 	}
 }
 

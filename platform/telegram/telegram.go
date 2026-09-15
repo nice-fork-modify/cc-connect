@@ -163,7 +163,10 @@ func New(opts map[string]any) (core.Platform, error) {
 
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
-	enableReactions, _ := opts["enable_reactions"].(bool)
+	enableReactions := true
+	if v, ok := opts["enable_reactions"].(bool); ok {
+		enableReactions = v
+	}
 
 	doneEmoji := "👌"
 	if v, ok := opts["done_emoji"].(string); ok {

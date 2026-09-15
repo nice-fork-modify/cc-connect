@@ -364,6 +364,72 @@ func (sp *streamPreview) unfreeze() {
 	sp.degraded = false
 }
 
+// adoptHandle takes over an already-sent platform message as this preview's
+// target, so the turn edits it in place instead of sending a new message.
+// ackText is what that message currently displays; it seeds lastSentText so
+// the dedupe in flushLocked does not re-send identical content.
+//
+// lastSentViaUpdate stays false on purpose: the adopted message was delivered
+// by SendPreviewStart, not by UpdateMessage, and finish() must still issue one
+// UpdateMessage for it (see the skip condition there).
+func (sp *streamPreview) adoptHandle(handle any, ackText string) {
+	if handle == nil {
+		return
+	}
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.previewMsgID = handle
+	sp.lastSentText = ackText
+	sp.lastSentViaUpdate = false
+	// Zero lastSentAt so the first frame after the takeover is not held back
+	// by the interval throttle.
+	sp.lastSentAt = time.Time{}
+}
+
+// showNotice puts text on this turn's preview message: it edits the message the
+// preview already owns (e.g. an adopted queue ack), or opens a new preview
+// message when the turn does not have one yet. Returns false when the platform
+// cannot host an editable preview, in which case the caller must deliver the
+// notice as a separate message.
+func (sp *streamPreview) showNotice(text string) bool {
+	if text == "" || !sp.canPreview() {
+		return false
+	}
+
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if sp.previewMsgID != nil {
+		updater, ok := sp.platform.(MessageUpdater)
+		if !ok {
+			return false
+		}
+		if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, text); err != nil {
+			slog.Debug("stream preview: notice update failed", "error", err)
+			return false
+		}
+		sp.lastSentText = text
+		sp.lastSentViaUpdate = true
+		sp.lastSentAt = time.Time{}
+		return true
+	}
+
+	starter, ok := sp.platform.(PreviewStarter)
+	if !ok {
+		return false
+	}
+	handle, err := starter.SendPreviewStart(sp.ctx, sp.replyCtx, text)
+	if err != nil || handle == nil {
+		slog.Debug("stream preview: notice start failed", "error", err)
+		return false
+	}
+	sp.previewMsgID = handle
+	sp.lastSentText = text
+	sp.lastSentViaUpdate = false
+	sp.lastSentAt = time.Time{}
+	return true
+}
+
 // discard removes the preview message when possible and disables further
 // preview updates. Call this when the caller intends to send a separate
 // non-preview message (for example after tool use or on terminal errors).

@@ -209,6 +209,8 @@ const (
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
+	MsgQueuedSuperseded          MsgKey = "queued_superseded"
+	MsgQueuedCancelled           MsgKey = "queued_cancelled"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
 	MsgCurrentSession            MsgKey = "current_session"
@@ -804,6 +806,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "📬 訊息已收到，將在目前任務完成後處理。",
 		LangJapanese:           "📬 メッセージを受信しました。現在のタスク完了後に処理します。",
 		LangSpanish:            "📬 Mensaje recibido — se procesará después de que termine la tarea actual.",
+	},
+	MsgQueuedSuperseded: {
+		LangEnglish:            "Superseded by a newer message — not executed.",
+		LangChinese:            "已被后续消息取代，未执行。",
+		LangTraditionalChinese: "已被後續訊息取代，未執行。",
+		LangJapanese:           "後続のメッセージに置き換えられました。実行されていません。",
+		LangSpanish:            "Reemplazado por un mensaje más reciente — no se ejecutó.",
+	},
+	MsgQueuedCancelled: {
+		LangEnglish:            "Cancelled — not executed.",
+		LangChinese:            "已取消，未执行。",
+		LangTraditionalChinese: "已取消，未執行。",
+		LangJapanese:           "キャンセルされました。実行されていません。",
+		LangSpanish:            "Cancelado — no se ejecutó.",
 	},
 	MsgQueueFull: {
 		LangEnglish:            "📬 Message queue is full (%d pending). Please wait for current tasks to complete.",

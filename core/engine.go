@@ -552,6 +552,17 @@ type queuedMessage struct {
 	channelKey        string // platform-provided channel identifier (preferred over sessionKey extraction)
 	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
 	turnSeq           int    // turn number assigned when this message was accepted
+
+	// ackHandle is the platform handle of the queue-ack message, when the
+	// platform could send it as an editable message. The turn that later runs
+	// this message adopts the handle as its stream preview target, so the ack
+	// evolves in place into the streamed answer instead of the user receiving
+	// a second bot message. nil means the ack went out on the plain reply path.
+	ackHandle any
+	// ackText is what the ack message currently displays (turn marker
+	// included). It seeds the preview dedupe on takeover, so it is recorded
+	// at send time rather than recomposed by the consumer.
+	ackText string
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -607,6 +618,13 @@ type interactiveState struct {
 	// Both are guarded by mu.
 	turnSeq        int
 	currentTurnSeq int
+
+	// currentTurnAnchor / currentTurnAnchorText hand a queued message's ack
+	// message to the turn that is about to run it, so that turn's stream
+	// preview edits the ack in place. Consumed (and cleared) by
+	// processInteractiveEvents when it builds the turn's preview.
+	currentTurnAnchor     any
+	currentTurnAnchorText string
 
 	// lastCompletedUserMessageTimeMs is the max platform user-message create time
 	// (ms) for which an agent turn has finished with EventResult.
@@ -2903,17 +2921,19 @@ func (e *Engine) removeQueuedMessageByID(messageID string) (string, bool) {
 			continue
 		}
 		filtered := pending[:0]
-		removed := false
+		var removed []queuedMessage
 		for _, queued := range pending {
 			if queued.messageID == messageID {
-				removed = true
+				removed = append(removed, queued)
 				continue
 			}
 			filtered = append(filtered, queued)
 		}
-		if removed {
+		if len(removed) > 0 {
 			state.pendingMessages = filtered
 			state.mu.Unlock()
+			// The recalled message will never run: close out its ack.
+			e.finalizeQueuedAcks(removed, MsgQueuedCancelled)
 			return sessionKey, true
 		}
 		state.mu.Unlock()
@@ -3738,8 +3758,71 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.turnTag(queuedSeq, turnIconQueued)+e.i18n.T(MsgMessageQueued))
+
+	// Send the ack as an editable anchor when the platform can open one, so the
+	// turn that eventually runs this message reuses it instead of posting a
+	// second message. Platforms without that capability keep the plain reply.
+	ackText := e.turnTag(queuedSeq, turnIconQueued) + e.i18n.T(MsgMessageQueued)
+	if handle := e.sendAnchorMessage(p, msg.ReplyCtx, ackText); handle != nil {
+		last := len(state.pendingMessages) - 1
+		state.pendingMessages[last].ackHandle = handle
+		state.pendingMessages[last].ackText = ackText
+	} else {
+		e.reply(p, msg.ReplyCtx, ackText)
+	}
 	return true
+}
+
+// sendAnchorMessage delivers content as a message the engine can edit later and
+// returns its platform handle. It returns nil when the platform cannot open an
+// editable message (it must be able to both start and update one) or the send
+// failed, in which case the caller falls back to a plain, non-editable message.
+func (e *Engine) sendAnchorMessage(p Platform, replyCtx any, content string) any {
+	starter, ok := p.(PreviewStarter)
+	if !ok {
+		return nil
+	}
+	if _, ok := p.(MessageUpdater); !ok {
+		return nil
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+		return nil
+	}
+	handle, err := starter.SendPreviewStart(e.ctx, replyCtx, content)
+	if err != nil {
+		slog.Debug("anchor message send failed, falling back to plain message",
+			"platform", p.Name(), "error", err)
+		return nil
+	}
+	return handle
+}
+
+// finalizeQueuedAck rewrites a queued message's ack anchor into a terminal
+// state. Queued messages that never run would otherwise leave their ack stuck
+// at "queued" forever. No-op when the ack was not sent as an anchor or the
+// platform cannot edit messages; no replacement message is sent in that case.
+func (e *Engine) finalizeQueuedAck(q queuedMessage, key MsgKey) {
+	if q.ackHandle == nil || q.platform == nil {
+		return
+	}
+	updater, ok := q.platform.(MessageUpdater)
+	if !ok {
+		return
+	}
+	text := e.turnTag(q.turnSeq, turnIconStopped) + e.i18n.T(key)
+	if err := updater.UpdateMessage(e.ctx, q.ackHandle, text); err != nil {
+		slog.Debug("queued ack finalize failed",
+			"platform", q.platform.Name(), "msg_id", q.messageID, "error", err)
+	}
+}
+
+// finalizeQueuedAcks applies finalizeQueuedAck to every message in the list.
+// The caller must NOT hold state.mu.
+func (e *Engine) finalizeQueuedAcks(queued []queuedMessage, key MsgKey) {
+	for _, q := range queued {
+		e.finalizeQueuedAck(q, key)
+	}
 }
 
 // ensureInteractiveStateForQueueing creates a placeholder interactiveState
@@ -5561,17 +5644,36 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	previewTag.set(e.turnTag(turnSeq, turnIconWorking))
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, previewTag.prefixRenderer(workspaceRenderer))
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
+	// A queued message hands its ack message over here; the preview then edits
+	// that message instead of opening a new one. Consume it so a later turn on
+	// the same state cannot inherit it.
+	turnAnchor, turnAnchorText := state.currentTurnAnchor, state.currentTurnAnchorText
+	state.currentTurnAnchor, state.currentTurnAnchorText = nil, ""
+	statePlatform, stateReplyCtx := state.platform, state.replyCtx
 	state.mu.Unlock()
 
-	// Send instant confirmation reply if enabled and no streaming card is active.
-	// Streaming cards provide their own "processing" indicator, so instant reply
-	// is only needed when the platform doesn't support cards or card creation failed.
-	if e.instantReply.Enabled && streamCard == nil {
-		replyContent := e.instantReply.Content
-		if replyContent == "" {
-			replyContent = e.i18n.T(MsgStarting)
+	sp.adoptHandle(turnAnchor, turnAnchorText)
+
+	// Two independent reasons to put a "working" notice on the preview:
+	//   - instant reply is on: send a confirmation the user would not get otherwise
+	//     (skipped when a streaming card is active, it has its own indicator),
+	//   - this turn adopted a queue ack: that message still reads "queued" while the
+	//     turn is already running, so it must be corrected regardless of the instant
+	//     reply switch — this only edits an existing message, it adds none.
+	// Both go through a single showNotice call so the message is edited once.
+	instantNotice := e.instantReply.Enabled && streamCard == nil
+	if instantNotice || turnAnchor != nil {
+		replyContent := e.i18n.T(MsgStarting)
+		if instantNotice && e.instantReply.Content != "" {
+			replyContent = e.instantReply.Content
 		}
-		e.send(state.platform, state.replyCtx, e.turnTag(turnSeq, turnIconWorking)+replyContent)
+		notice := e.turnTag(turnSeq, turnIconWorking) + replyContent
+		// Prefer the turn's preview message so the notice, the streamed text and
+		// the final answer are one message; fall back to a separate message only
+		// for the instant reply, never for the anchor flip.
+		if !sp.showNotice(notice) && instantNotice {
+			e.send(statePlatform, stateReplyCtx, notice)
+		}
 	}
 
 	// Idle timeout: resets on every received event (0 = disabled)
@@ -6706,18 +6808,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			// Check for queued messages — if present, continue the event loop
 			// for the next turn instead of returning.
+			e.dropStaleQueuedMessages(state, sessionKey, "after_completed_turn")
 			state.mu.Lock()
-			droppedStale := 0
-			for len(state.pendingMessages) > 0 && e.isQueuedUserMessageStaleForDrainLocked(state, state.pendingMessages[0].userMessageTimeMs) {
-				state.pendingMessages = state.pendingMessages[1:]
-				droppedStale++
-			}
-			if droppedStale > 0 {
-				slog.Info("dropped stale queued user messages after completed turn",
-					"session", sessionKey,
-					"dropped", droppedStale,
-				)
-			}
 			if len(state.pendingMessages) > 0 {
 				queued := state.pendingMessages[0]
 				state.pendingMessages = state.pendingMessages[1:]
@@ -6818,6 +6910,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				previewTag = &turnTagHolder{}
 				previewTag.set(e.turnTag(turnSeq, turnIconWorking))
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, previewTag.prefixRenderer(queuedRenderer))
+				// Reuse the queue ack as this turn's preview message so the user
+				// sees one message evolve instead of a second bot message.
+				sp.adoptHandle(queued.ackHandle, queued.ackText)
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
 
 				// Reset streaming card state for the next turn
@@ -6835,13 +6930,19 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
-				// Send instant reply for queued turn if no streaming card is active.
-				if e.instantReply.Enabled && streamCard == nil {
-					replyContent := e.instantReply.Content
-					if replyContent == "" {
-						replyContent = e.i18n.T(MsgStarting)
+				// Notice on the preview for the queued turn: either because instant
+				// reply is on, or because the adopted ack still reads "queued" while
+				// this turn is already running. See the same block above.
+				queuedInstantNotice := e.instantReply.Enabled && streamCard == nil
+				if queuedInstantNotice || queued.ackHandle != nil {
+					replyContent := e.i18n.T(MsgStarting)
+					if queuedInstantNotice && e.instantReply.Content != "" {
+						replyContent = e.instantReply.Content
 					}
-					e.send(queued.platform, queued.replyCtx, e.turnTag(turnSeq, turnIconWorking)+replyContent)
+					notice := e.turnTag(turnSeq, turnIconWorking) + replyContent
+					if !sp.showNotice(notice) && queuedInstantNotice {
+						e.send(queued.platform, queued.replyCtx, notice)
+					}
 				}
 
 				session.AddHistory("user", queued.content)
@@ -7053,9 +7154,44 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 	remaining := state.pendingMessages
 	state.pendingMessages = nil
 	state.mu.Unlock()
+	e.finalizeQueuedAcks(remaining, MsgQueuedCancelled)
 	for _, q := range remaining {
 		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
 	}
+}
+
+// clearQueuedMessages drops every queued message without notifying its sender.
+// The ack anchors are still finalized, so no ack is left showing "queued" for a
+// message that will never run.
+func (e *Engine) clearQueuedMessages(state *interactiveState) {
+	state.mu.Lock()
+	remaining := state.pendingMessages
+	state.pendingMessages = nil
+	state.mu.Unlock()
+	e.finalizeQueuedAcks(remaining, MsgQueuedCancelled)
+}
+
+// dropStaleQueuedMessages removes the queued messages at the head of the queue
+// that a newer already-accepted user message has superseded, and rewrites their
+// acks to a terminal state. The caller must NOT hold state.mu.
+func (e *Engine) dropStaleQueuedMessages(state *interactiveState, sessionKey, phase string) {
+	state.mu.Lock()
+	var dropped []queuedMessage
+	for len(state.pendingMessages) > 0 && e.isQueuedUserMessageStaleForDrainLocked(state, state.pendingMessages[0].userMessageTimeMs) {
+		dropped = append(dropped, state.pendingMessages[0])
+		state.pendingMessages = state.pendingMessages[1:]
+	}
+	state.mu.Unlock()
+
+	if len(dropped) == 0 {
+		return
+	}
+	slog.Info("dropped stale queued user messages",
+		"session", sessionKey,
+		"phase", phase,
+		"dropped", len(dropped),
+	)
+	e.finalizeQueuedAcks(dropped, MsgQueuedSuperseded)
 }
 
 // drainPendingMessages processes all queued messages in the state's pendingMessages
@@ -7064,6 +7200,8 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // Returns true if the session was unlocked by this call.
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, lockGen uint64) bool {
 	for {
+		e.dropStaleQueuedMessages(state, sessionKey, "drain")
+
 		state.mu.Lock()
 		if len(state.pendingMessages) == 0 {
 			session.Unlock(lockGen)
@@ -7095,6 +7233,10 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		// The queued message keeps the number it was given at accept time.
 		state.currentTurnSeq = queued.turnSeq
+		// Hand the ack message to the turn: processInteractiveEvents adopts it
+		// as the turn's stream preview target.
+		state.currentTurnAnchor = queued.ackHandle
+		state.currentTurnAnchorText = queued.ackText
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
@@ -7104,6 +7246,12 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)
 		state.mu.Unlock()
 		if as == nil || !as.Alive() {
+			// This message will not run after all: take its ack back from the
+			// turn and close it out instead of leaving it at "queued".
+			state.mu.Lock()
+			state.currentTurnAnchor, state.currentTurnAnchorText = nil, ""
+			state.mu.Unlock()
+			e.finalizeQueuedAck(queued, MsgQueuedCancelled)
 			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 			return false
@@ -11127,9 +11275,7 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 		if notifyQueued {
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("session cancelled"))
 		} else {
-			state.mu.Lock()
-			state.pendingMessages = nil
-			state.mu.Unlock()
+			e.clearQueuedMessages(state)
 		}
 
 		// Mark eventsNeedResync so the next turn drains stale events from
@@ -11172,9 +11318,7 @@ normalCleanup:
 	if notifyQueued {
 		e.notifyDroppedQueuedMessages(state, fmt.Errorf("session reset"))
 	} else {
-		state.mu.Lock()
-		state.pendingMessages = nil
-		state.mu.Unlock()
+		e.clearQueuedMessages(state)
 	}
 	e.closeAgentSessionAsync(sessionKey, agentSession, closePlatform, closeReplyCtx)
 

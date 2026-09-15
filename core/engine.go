@@ -30,7 +30,7 @@ import (
 
 const maxPlatformMessageLen = 4000
 const telegramBotCommandLimit = 100
-const defaultMaxQueuedMessages = 5 // default cap for queued messages per session
+const defaultMaxQueuedMessages = 20 // default cap for queued messages per session
 
 // defaultPendingRestartTimeout is how long the post-restart notify
 // dispatcher waits for the target platform to reach ready before

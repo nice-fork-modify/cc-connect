@@ -145,7 +145,7 @@ type CronConfig struct {
 
 // QueueConfig controls the per-session message queue.
 type QueueConfig struct {
-	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 5
+	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 20
 }
 
 // WebhookConfig controls the external HTTP webhook endpoint.
@@ -3905,7 +3905,7 @@ func GetGlobalSettings() map[string]any {
 	}
 	result["rate_limit_window_secs"] = rlWindow
 	// Queue
-	queueMax := 5
+	queueMax := 20
 	if cfg.Queue.MaxDepth != nil {
 		queueMax = *cfg.Queue.MaxDepth
 	}

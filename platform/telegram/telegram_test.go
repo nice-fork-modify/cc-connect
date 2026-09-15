@@ -83,6 +83,9 @@ type stubTelegramBot struct {
 	getFileCalls         int
 	setReactionCalls     int
 
+	lastSendMessageParams *tgbot.SendMessageParams
+	lastReactionParams    *tgbot.SetMessageReactionParams
+
 	sendErr    error
 	getFileErr error
 	file       *models.File
@@ -94,9 +97,10 @@ func newStubTelegramBot() *stubTelegramBot {
 	}
 }
 
-func (b *stubTelegramBot) SendMessage(_ context.Context, _ *tgbot.SendMessageParams) (*models.Message, error) {
+func (b *stubTelegramBot) SendMessage(_ context.Context, params *tgbot.SendMessageParams) (*models.Message, error) {
 	b.mu.Lock()
 	b.sendMessageCalls++
+	b.lastSendMessageParams = params
 	b.mu.Unlock()
 	if b.sendErr != nil {
 		return nil, b.sendErr
@@ -205,11 +209,24 @@ func (b *stubTelegramBot) FileDownloadLink(f *models.File) string {
 	return "https://test.example.com/file/" + f.FilePath
 }
 
-func (b *stubTelegramBot) SetMessageReaction(_ context.Context, _ *tgbot.SetMessageReactionParams) (bool, error) {
+func (b *stubTelegramBot) SetMessageReaction(_ context.Context, params *tgbot.SetMessageReactionParams) (bool, error) {
 	b.mu.Lock()
 	b.setReactionCalls++
+	b.lastReactionParams = params
 	b.mu.Unlock()
 	return true, nil
+}
+
+func (b *stubTelegramBot) LastSendMessageParams() *tgbot.SendMessageParams {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastSendMessageParams
+}
+
+func (b *stubTelegramBot) SetReactionCallCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.setReactionCalls
 }
 
 func (b *stubTelegramBot) SendMessageCallCount() int {
@@ -1036,6 +1053,151 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 	}
 }
 
+func TestSendPreviewStart_ReplyParameters(t *testing.T) {
+	tests := []struct {
+		name      string
+		messageID int
+		wantReply bool
+	}{
+		{name: "with triggering message", messageID: 42, wantReply: true},
+		{name: "without triggering message", messageID: 0, wantReply: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubBot := newStubTelegramBot()
+			p := &Platform{bot: stubBot}
+			rc := replyContext{chatID: 1, messageID: tt.messageID}
+
+			if _, err := p.SendPreviewStart(context.Background(), rc, "preview"); err != nil {
+				t.Fatalf("SendPreviewStart: %v", err)
+			}
+
+			params := stubBot.LastSendMessageParams()
+			if params == nil {
+				t.Fatal("SendMessage was not called")
+			}
+			if tt.wantReply {
+				if params.ReplyParameters == nil || params.ReplyParameters.MessageID != tt.messageID {
+					t.Fatalf("ReplyParameters = %+v, want MessageID %d", params.ReplyParameters, tt.messageID)
+				}
+			} else if params.ReplyParameters != nil {
+				t.Fatalf("ReplyParameters = %+v, want nil", params.ReplyParameters)
+			}
+		})
+	}
+}
+
+func TestSend_ReplyParameters(t *testing.T) {
+	tests := []struct {
+		name      string
+		messageID int
+		wantReply bool
+	}{
+		{name: "with triggering message", messageID: 42, wantReply: true},
+		{name: "without triggering message", messageID: 0, wantReply: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubBot := newStubTelegramBot()
+			p := &Platform{bot: stubBot}
+			rc := replyContext{chatID: 1, messageID: tt.messageID}
+
+			if err := p.Send(context.Background(), rc, "hello"); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+
+			params := stubBot.LastSendMessageParams()
+			if params == nil {
+				t.Fatal("SendMessage was not called")
+			}
+			if tt.wantReply {
+				if params.ReplyParameters == nil || params.ReplyParameters.MessageID != tt.messageID {
+					t.Fatalf("ReplyParameters = %+v, want MessageID %d", params.ReplyParameters, tt.messageID)
+				}
+			} else if params.ReplyParameters != nil {
+				t.Fatalf("ReplyParameters = %+v, want nil", params.ReplyParameters)
+			}
+		})
+	}
+}
+
+func TestKeepPreviewOnFinish(t *testing.T) {
+	p := &Platform{}
+	if !p.KeepPreviewOnFinish() {
+		t.Fatal("KeepPreviewOnFinish() = false, want true")
+	}
+}
+
+func TestAddDoneReaction(t *testing.T) {
+	tests := []struct {
+		name            string
+		enableReactions bool
+		doneEmoji       string
+		messageID       int
+		wantReaction    bool
+	}{
+		{name: "enabled with emoji", enableReactions: true, doneEmoji: "👌", messageID: 42, wantReaction: true},
+		{name: "done_emoji none disables reaction", enableReactions: true, doneEmoji: "", messageID: 42, wantReaction: false},
+		{name: "reactions disabled", enableReactions: false, doneEmoji: "👌", messageID: 42, wantReaction: false},
+		{name: "no triggering message", enableReactions: true, doneEmoji: "👌", messageID: 0, wantReaction: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubBot := newStubTelegramBot()
+			p := &Platform{bot: stubBot, enableReactions: tt.enableReactions, doneEmoji: tt.doneEmoji}
+			rc := replyContext{chatID: 1, messageID: tt.messageID}
+
+			p.AddDoneReaction(rc)
+
+			deadline := time.After(200 * time.Millisecond)
+		waitLoop:
+			for {
+				if stubBot.SetReactionCallCount() > 0 {
+					break
+				}
+				select {
+				case <-deadline:
+					break waitLoop
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			gotReaction := stubBot.SetReactionCallCount() > 0
+			if gotReaction != tt.wantReaction {
+				t.Fatalf("reaction called = %v, want %v", gotReaction, tt.wantReaction)
+			}
+			if tt.wantReaction {
+				params := stubBot.lastReactionParams
+				if params == nil || len(params.Reaction) != 1 || params.Reaction[0].ReactionTypeEmoji == nil || params.Reaction[0].ReactionTypeEmoji.Emoji != tt.doneEmoji {
+					t.Fatalf("reaction params = %+v, want emoji %q", params, tt.doneEmoji)
+				}
+			}
+		})
+	}
+}
+
+func TestNewDoneEmojiOption(t *testing.T) {
+	p, err := New(map[string]any{"token": "test-token"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tg := p.(*Platform)
+	if tg.doneEmoji != "👌" {
+		t.Fatalf("default doneEmoji = %q, want %q", tg.doneEmoji, "👌")
+	}
+
+	p2, err := New(map[string]any{"token": "test-token", "done_emoji": "none"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tg2 := p2.(*Platform)
+	if tg2.doneEmoji != "" {
+		t.Fatalf("doneEmoji = %q, want empty when done_emoji=none", tg2.doneEmoji)
+	}
+}
+
 func TestIsTooLongErr(t *testing.T) {
 	tests := []struct {
 		errMsg string
@@ -1053,4 +1215,3 @@ func TestIsTooLongErr(t *testing.T) {
 		}
 	}
 }
-

@@ -110,6 +110,7 @@ type Platform struct {
 	groupReplyAll         bool
 	shareSessionInChannel bool
 	enableReactions       bool
+	doneEmoji             string
 	progressStyle         string // "legacy" | "compact" — telegram has no rich card, so "card" is mapped to "compact"
 	httpClient            *http.Client
 
@@ -164,6 +165,15 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	enableReactions, _ := opts["enable_reactions"].(bool)
 
+	doneEmoji := "👌"
+	if v, ok := opts["done_emoji"].(string); ok {
+		if v == "none" {
+			doneEmoji = ""
+		} else if v != "" {
+			doneEmoji = v
+		}
+	}
+
 	// Default to "compact" so streaming edits work out of the box. Telegram has
 	// no rich card UI, so "card" is normalized to "compact". Users can opt out
 	// via progress_style = "legacy" to restore the old "send full text once"
@@ -188,6 +198,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		groupReplyAll:         groupReplyAll,
 		shareSessionInChannel: shareSessionInChannel,
 		enableReactions:       enableReactions,
+		doneEmoji:             doneEmoji,
 		progressStyle:         progressStyle,
 		httpClient:            httpClient,
 	}, nil
@@ -630,6 +641,20 @@ func (p *Platform) reactToMessage(ctx context.Context, chatID int64, messageID i
 	}); err != nil {
 		slog.Debug("telegram: set reaction failed", "error", err)
 	}
+}
+
+// AddDoneReaction replaces the ⚡ reaction on the triggering user message with
+// the configured "done" emoji once the turn finishes. It is a no-op when
+// reactions are disabled or done_emoji is set to "none".
+func (p *Platform) AddDoneReaction(replyCtx any) {
+	if !p.enableReactions || p.doneEmoji == "" {
+		return
+	}
+	rc, ok := replyCtx.(replyContext)
+	if !ok || rc.messageID == 0 {
+		return
+	}
+	go p.reactToMessage(context.Background(), rc.chatID, rc.messageID, p.doneEmoji)
 }
 
 func (p *Platform) buildSessionKey(chatID int64, threadID int, userID int64) string {
@@ -1100,6 +1125,9 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 		Text:            html,
 		ParseMode:       models.ParseModeHTML,
 	}
+	if rc.messageID != 0 {
+		params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
+	}
 
 	if _, err := bot.SendMessage(ctx, params); err != nil {
 		errMsg := err.Error()
@@ -1325,6 +1353,10 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 	return nil
 }
 
+// KeepPreviewOnFinish reports that the preview message should be edited in
+// place with the final response instead of being deleted and resent.
+func (p *Platform) KeepPreviewOnFinish() bool { return true }
+
 // DeletePreviewMessage deletes a stale preview message so the caller can send a fresh one.
 func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) error {
 	h, ok := previewHandle.(*telegramPreviewHandle)
@@ -1431,6 +1463,9 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		MessageThreadID: rc.threadID,
 		Text:            html,
 		ParseMode:       models.ParseModeHTML,
+	}
+	if rc.messageID != 0 {
+		params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
 	}
 
 	sent, err := bot.SendMessage(ctx, params)

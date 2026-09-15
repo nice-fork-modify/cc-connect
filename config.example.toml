@@ -139,6 +139,12 @@ level = "info" # debug, info, warn, error
 #                                # 在助手回复底部显示类似 Codex 的状态行（默认 true 显示）
 # hide_agent_footer = false      # Strip standalone model/token footer lines emitted by agents (default: false)
 #                                # 过滤 agent 自己混入正文的模型/token 统计 footer 行（默认 false 不过滤）
+# turn_tag = true                # Prefix bot output with a turn marker like "[#1 ⏳] " so each reply can be
+#                                # matched to the message that triggered it (default: true; set false to disable).
+#                                # Icons: ⏳ working, 📬 queued, ✅ done, ❓ waiting for you, ❌ failed, ⏹ stopped.
+#                                # 在机器人输出前加上形如「[#1 ⏳] 」的轮次标记，便于把回复和触发它的消息对应起来
+#                                # （默认 true，设为 false 可关闭）。
+#                                # 图标含义：⏳ 处理中、📬 已排队、✅ 已完成、❓ 等待你的输入、❌ 失败、⏹ 已中止。
 
 # Per-project override: each [[projects]] entry may have its own [projects.display]
 # block that overrides individual fields of the global [display] block above.

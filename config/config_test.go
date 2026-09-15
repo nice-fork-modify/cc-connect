@@ -522,6 +522,45 @@ func TestEffectiveDisplayHideAgentFooter(t *testing.T) {
 	}
 }
 
+func TestEffectiveTurnTag(t *testing.T) {
+	tru := true
+	fal := false
+
+	tests := []struct {
+		name string
+		cfg  Config
+		proj ProjectConfig
+		want bool
+	}{
+		{
+			name: "default true",
+			cfg:  Config{},
+			proj: ProjectConfig{},
+			want: true,
+		},
+		{
+			name: "global false disables",
+			cfg:  Config{Display: DisplayConfig{TurnTag: &fal}},
+			proj: ProjectConfig{},
+			want: false,
+		},
+		{
+			name: "project overrides global",
+			cfg:  Config{Display: DisplayConfig{TurnTag: &fal}},
+			proj: ProjectConfig{Display: &DisplayConfig{TurnTag: &tru}},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := EffectiveTurnTag(&tt.cfg, &tt.proj); got != tt.want {
+				t.Fatalf("EffectiveTurnTag() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateProjectDisplayConfig(t *testing.T) {
 	mode := "verbose"
 	cardMode := "modern"

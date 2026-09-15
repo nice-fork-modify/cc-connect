@@ -339,6 +339,7 @@ type DisplayCfg struct {
 	ToolMessages     bool
 	HistoryMaxLen    *int // max runes for /history entries; nil = default, 0 = no truncation
 	HideAgentFooter  bool // strip model/token footer lines emitted as agent text
+	TurnTag          bool // prefix bot output with a turn marker like "[#1 ⏳] "
 }
 
 // InstantReplyCfg controls the immediate confirmation reply sent when a message
@@ -550,6 +551,7 @@ type queuedMessage struct {
 	msgSessionKey     string // session key for extracting chat ID
 	channelKey        string // platform-provided channel identifier (preferred over sessionKey extraction)
 	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
+	turnSeq           int    // turn number assigned when this message was accepted
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -596,6 +598,15 @@ type interactiveState struct {
 	// the next turn (e.g. after an abnormal exit). Defaults to true (safe);
 	// cleared to false only after a clean EventResult.
 	eventsNeedResync bool
+
+	// turnSeq is the monotonic turn counter for this interactive session. A
+	// number is allocated when a user message is accepted (either to start
+	// processing immediately or into the FIFO queue), so the numbering follows
+	// the order in which the user sent the messages.
+	// currentTurnSeq is the number of the turn currently in flight.
+	// Both are guarded by mu.
+	turnSeq        int
+	currentTurnSeq int
 
 	// lastCompletedUserMessageTimeMs is the max platform user-message create time
 	// (ms) for which an agent turn has finished with EventResult.
@@ -779,7 +790,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		cancel:                cancel,
 		i18n:                  NewI18n(lang),
 		attachmentSendEnabled: true,
-		display:               DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: defaultThinkingMaxLen, ToolMaxLen: defaultToolMaxLen, ToolMessages: true, CardMode: "legacy"},
+		display:               DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: defaultThinkingMaxLen, ToolMaxLen: defaultToolMaxLen, ToolMessages: true, CardMode: "legacy", TurnTag: true},
 		commands:              NewCommandRegistry(),
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
@@ -2969,6 +2980,23 @@ func (e *Engine) noteUserMessageAccepted(interactiveKey string, timeMs int64) {
 	state.mu.Unlock()
 }
 
+// assignCurrentTurnSeq allocates the next turn number for a user message that
+// is about to start processing immediately, and marks it as the in-flight turn.
+// Queued messages get their number in queueMessageForBusySession instead, so
+// the numbering always follows the order in which messages were accepted.
+func (e *Engine) assignCurrentTurnSeq(interactiveKey string) {
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if !ok || state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.turnSeq++
+	state.currentTurnSeq = state.turnSeq
+	state.mu.Unlock()
+}
+
 // discardStaleUserMessageIfNeeded returns true when the message is dropped
 // because a newer user message is already in progress, queued, or completed
 // for this interactive session (e.g. Feishu redelivery with a new message_id
@@ -3525,6 +3553,7 @@ sessionLocked:
 	// reset because cleanupInteractiveState may remove the early placeholder.
 	e.ensureInteractiveStateForQueueing(interactiveKey, p, msg.ReplyCtx)
 	e.noteUserMessageAccepted(interactiveKey, msg.UserMessageTimeMs)
+	e.assignCurrentTurnSeq(interactiveKey)
 	runMessageAccepted(msg)
 	slog.Debug("user message accepted for processing",
 		"platform", msg.Platform,
@@ -3673,6 +3702,10 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
 		return true // handled: queue-full reply sent
 	}
+	// The turn number is allocated here, at accept time, so the queue ack can
+	// show it right away and the numbering matches the send order.
+	state.turnSeq++
+	queuedSeq := state.turnSeq
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		messageID:         msg.MessageID,
 		platform:          p,
@@ -3687,6 +3720,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		msgSessionKey:     msg.SessionKey,
 		channelKey:        msg.ChannelKey,
 		userMessageTimeMs: msg.UserMessageTimeMs,
+		turnSeq:           queuedSeq,
 	})
 	runMessageAccepted(msg)
 	queueDepth := len(state.pendingMessages)
@@ -3704,7 +3738,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	e.reply(p, msg.ReplyCtx, e.turnTag(queuedSeq, turnIconQueued)+e.i18n.T(MsgMessageQueued))
 	return true
 }
 
@@ -3884,7 +3918,7 @@ found:
 		if curIdx+1 < len(pending.Questions) {
 			pending.CurrentQuestion = curIdx + 1
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
-			e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1)
+			e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1, e.currentTurnTag(state, turnIconAwaiting))
 			return true
 		}
 
@@ -4481,8 +4515,9 @@ func (e *Engine) workspaceContext(workspace, sessionKey string) (Agent, *Session
 }
 
 // getOrCreateInteractiveStateWith accepts an optional agent override for multi-workspace mode.
-// adoptPendingFromPlaceholder copies pendingMessages from an existing placeholder
-// state to newState so queued messages are not lost when the map entry is replaced.
+// adoptPendingFromPlaceholder copies pendingMessages and the turn counters from
+// an existing placeholder state to newState so queued messages and turn
+// numbering are not lost when the map entry is replaced.
 // Must be called under interactiveMu.
 func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 	if existing == nil || existing == newState {
@@ -4492,6 +4527,15 @@ func adoptPendingFromPlaceholder(existing, newState *interactiveState) {
 	if len(existing.pendingMessages) > 0 {
 		newState.pendingMessages = existing.pendingMessages
 		existing.pendingMessages = nil
+	}
+	// Turn numbering must survive the placeholder→real state swap, otherwise
+	// the counter restarts at 1 while messages queued on the placeholder still
+	// carry their original numbers.
+	if existing.turnSeq > newState.turnSeq {
+		newState.turnSeq = existing.turnSeq
+	}
+	if existing.currentTurnSeq > newState.currentTurnSeq {
+		newState.currentTurnSeq = existing.currentTurnSeq
 	}
 	existing.mu.Unlock()
 }
@@ -5437,6 +5481,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		state.mu.Unlock()
 	}
 
+	// currentTurnSeq means "the user turn currently in flight, 0 if none".
+	// Clearing it when the loop exits keeps turns that never went through
+	// message acceptance (cron / timer, which reach this loop directly and may
+	// reuse the user's live session) from inheriting the previous user turn's
+	// number and labelling their output with it.
+	defer func() {
+		state.mu.Lock()
+		state.currentTurnSeq = 0
+		state.mu.Unlock()
+	}()
+
 	var textParts []string
 	var segmentStart int // index into textParts: text before this has been sent/displayed
 	silentHold := false  // true while accumulated segment text could still resolve to a bare NO_REPLY marker
@@ -5468,6 +5523,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	state.mu.Lock()
 	workspaceDir := state.workspaceDir
+	// turnSeq is the number of the turn this loop is currently running. It is
+	// reassigned when the loop picks up a queued message below.
+	turnSeq := state.currentTurnSeq
 	replyAgent := state.agent
 	if replyAgent == nil {
 		replyAgent = e.agent
@@ -5496,7 +5554,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			slog.Info("streaming card created for turn", "session", sessionKey)
 		}
 	}
-	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
+	// previewTag injects the turn marker into every stream preview frame. It is
+	// kept out of the preview's accumulated text so the marker never takes part
+	// in the MinDeltaChars / dedupe accounting.
+	previewTag := &turnTagHolder{}
+	previewTag.set(e.turnTag(turnSeq, turnIconWorking))
+	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, previewTag.prefixRenderer(workspaceRenderer))
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	state.mu.Unlock()
 
@@ -5508,7 +5571,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		if replyContent == "" {
 			replyContent = e.i18n.T(MsgStarting)
 		}
-		e.send(state.platform, state.replyCtx, replyContent)
+		e.send(state.platform, state.replyCtx, e.turnTag(turnSeq, turnIconWorking)+replyContent)
 	}
 
 	// Idle timeout: resets on every received event (0 = disabled)
@@ -5559,7 +5622,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Lock()
 				p := state.platform
 				state.mu.Unlock()
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				e.send(p, replyCtx, e.turnTag(turnSeq, turnIconFailed)+fmt.Sprintf(e.i18n.T(MsgError), err))
 				return
 			}
 			continue
@@ -5572,7 +5635,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			p := state.platform
 			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
+			e.send(p, replyCtx, e.turnTag(turnSeq, turnIconFailed)+fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-turnDeadlineCh:
@@ -5584,7 +5647,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Lock()
 			p := state.platform
 			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError),
+			e.send(p, replyCtx, e.turnTag(turnSeq, turnIconFailed)+fmt.Sprintf(e.i18n.T(MsgError),
 				fmt.Sprintf("agent turn exceeded maximum time (%v), stopping", e.maxTurnTime)))
 
 			// Two-phase shutdown: first try a graceful stop so the agent can
@@ -6157,14 +6220,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Unlock()
 
 			if isAskQuestion {
-				e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
+				e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0, e.turnTag(turnSeq, turnIconAwaiting))
 			} else {
 				permLimit := e.display.ToolMaxLen
 				if permLimit > 0 {
 					permLimit = permLimit * 8 / 5
 				}
 				toolInput := truncateIf(event.ToolInput, permLimit)
-				prompt := fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
+				prompt := e.turnTag(turnSeq, turnIconAwaiting) + fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
 				e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput)
 			}
 
@@ -6439,6 +6502,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			replyStart := time.Now()
 
+			// The turn is finished: flip the stream preview marker so the
+			// in-place final edit carries the "done" icon instead of "working".
+			// doneTag is the same marker for the paths that send a fresh message
+			// instead of editing the preview.
+			previewTag.set(e.turnTag(turnSeq, turnIconDone))
+			doneTag := e.turnTag(turnSeq, turnIconDone)
+
 			// --- StreamingCard path ---
 			if streamCard != nil && !streamCard.Failed() {
 				sp.finish("", "") // cleanup preview (should be no-op if card was active)
@@ -6563,7 +6633,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if segmentStart < len(textParts) {
 					unsent := strings.Join(textParts[segmentStart:], "")
 					if unsent != "" {
-						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, unsent, statusFooter, sendWorkspaceWithError) {
+						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, doneTag+unsent, statusFooter, sendWorkspaceWithError) {
 							return
 						}
 					}
@@ -6572,16 +6642,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp.discard()
 				metaOnly := strings.TrimSpace(strings.TrimPrefix(fullResponse, baseResponse))
 				if metaOnly != "" || statusFooter != "" {
-					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, metaOnly, statusFooter, sendWorkspaceWithError) {
+					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, doneTag+metaOnly, statusFooter, sendWorkspaceWithError) {
 						return
 					}
 				}
 				slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
 			} else if sp.finish(fullResponse, statusFooter) {
+				// The marker was injected by the preview's transform hook, so
+				// fullResponse itself must stay unprefixed here.
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
 			} else {
 				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
-				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
+				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, doneTag+fullResponse, statusFooter, sendWorkspaceWithError) {
 					return
 				}
 			}
@@ -6655,6 +6727,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.currentMessageID = queued.messageID
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+				// The queued message already carries the number it was given at
+				// accept time; it must not be renumbered here.
+				state.currentTurnSeq = queued.turnSeq
 				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
@@ -6662,12 +6737,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					stopTyping()
 					stopTyping = nil
 				}
+				// The turn that just finished gets its own done reaction before
+				// the loop switches to the queued message. finishedReplyCtx is
+				// captured by value because replyCtx is reassigned below for the
+				// next turn — without that, the reaction would land on the wrong
+				// message. It must run after stopTyping(), which it replaces.
+				if !isSilent && !hasRichCard {
+					if doneTI, ok := p.(TypingIndicatorDone); ok {
+						finishedReplyCtx := replyCtx
+						doneTI.AddDoneReaction(finishedReplyCtx)
+					}
+				}
+				// The reaction for this turn was just emitted; the deferred one
+				// belongs to whichever turn ends the loop.
+				doneReaction = nil
 				// Start a new typing indicator for the queued message's context
 				if ti, ok := queued.platform.(TypingIndicator); ok {
 					stopTyping = ti.StartTyping(e.ctx, queued.replyCtx)
 				}
-				// Agent continues working — don't add done reaction for this turn.
-				doneReaction = nil
 
 				// Drain stale events before starting the next turn. Between
 				// EventResult and Send(), the only buffered events would be
@@ -6702,6 +6789,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 				// Reset per-turn state for the next turn
 				msgID = queued.messageID
+				turnSeq = queued.turnSeq
 				textParts = nil
 				segmentStart = 0
 				toolCount = 0
@@ -6727,7 +6815,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				queuedRenderer := func(content string) string {
 					return e.renderOutgoingContentForWorkspace(queued.platform, content, workspaceDir)
 				}
-				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
+				previewTag = &turnTagHolder{}
+				previewTag.set(e.turnTag(turnSeq, turnIconWorking))
+				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, previewTag.prefixRenderer(queuedRenderer))
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
 
 				// Reset streaming card state for the next turn
@@ -6751,7 +6841,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if replyContent == "" {
 						replyContent = e.i18n.T(MsgStarting)
 					}
-					e.send(queued.platform, queued.replyCtx, replyContent)
+					e.send(queued.platform, queued.replyCtx, e.turnTag(turnSeq, turnIconWorking)+replyContent)
 				}
 
 				session.AddHistory("user", queued.content)
@@ -6787,7 +6877,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// silent turns and rich card mode (the card itself shows done status).
 			if !isSilent && !hasRichCard {
 				if doneTI, ok := p.(TypingIndicatorDone); ok {
-					doneReaction = func() { doneTI.AddDoneReaction(replyCtx) }
+					// Capture by value: replyCtx is a mutable local that the
+					// queued-message branch reassigns.
+					finishedReplyCtx := replyCtx
+					doneReaction = func() { doneTI.AddDoneReaction(finishedReplyCtx) }
 				}
 			}
 
@@ -6823,7 +6916,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						break
 					}
 				}
-				e.send(p, replyCtx, userMsg)
+				e.send(p, replyCtx, e.turnTag(turnSeq, turnIconFailed)+userMsg)
 			}
 			// Only drop queued messages if the agent session is dead.
 			// Some agents (e.g. Codex) emit EventError for per-turn failures
@@ -6838,6 +6931,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 channelClosed:
 	// Channel closed - process exited unexpectedly
 	slog.Warn("agent process exited", "session_key", sessionKey)
+	// The turn did not complete: any partial text delivered below carries the
+	// failure marker instead of the "working" one.
+	previewTag.set(e.turnTag(turnSeq, turnIconFailed))
+	failedTag := e.turnTag(turnSeq, turnIconFailed)
 	state.mu.Lock()
 	state.eventsNeedResync = true
 	state.mu.Unlock()
@@ -6882,7 +6979,7 @@ channelClosed:
 			if segmentStart < len(textParts) {
 				unsent := strings.Join(textParts[segmentStart:], "")
 				if unsent != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(unsent, maxPlatformMessageLen) {
+					for _, chunk := range SplitMessageCodeFenceAware(failedTag+unsent, maxPlatformMessageLen) {
 						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 							return
 						}
@@ -6892,7 +6989,7 @@ channelClosed:
 		} else if sp.finish(fullResponse, "") {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
-			for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+			for _, chunk := range SplitMessageCodeFenceAware(failedTag+fullResponse, maxPlatformMessageLen) {
 				if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 					return
 				}
@@ -6996,6 +7093,8 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.currentMessageID = queued.messageID
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
+		// The queued message keeps the number it was given at accept time.
+		state.currentTurnSeq = queued.turnSeq
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
@@ -10928,20 +11027,31 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
 	// latest forked session, so resuming after /stop is safe and no longer
 	// triggers the recycling loop from issue #830.
 	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
+	// Read the aborted turn's number before stopping: a normal stop removes the
+	// state from the map.
+	stoppedTag := e.currentTurnTag(e.lookupInteractiveState(iKey), turnIconStopped)
 	if !e.stopInteractiveSession(iKey, p, msg.ReplyCtx) {
 		// Fallback: try suffix scan in case interactiveKeyForSessionKey
 		// resolved a different key than the one used to store the state
 		// (e.g. workspace binding lookup inconsistency).
 		if found := e.findInteractiveKeyForSession(msg.SessionKey); found != "" && found != iKey {
+			stoppedTag = e.currentTurnTag(e.lookupInteractiveState(found), turnIconStopped)
 			if e.stopInteractiveSession(found, p, msg.ReplyCtx) {
-				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
+				e.reply(p, msg.ReplyCtx, stoppedTag+e.i18n.T(MsgExecutionStopped))
 				return
 			}
 		}
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
 		return
 	}
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgExecutionStopped))
+	e.reply(p, msg.ReplyCtx, stoppedTag+e.i18n.T(MsgExecutionStopped))
+}
+
+// lookupInteractiveState returns the interactive state for a key, or nil.
+func (e *Engine) lookupInteractiveState(key string) *interactiveState {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	return e.interactiveStates[key]
 }
 
 // cmdCancel stops the current execution and starts a fresh session.
@@ -12451,8 +12561,9 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 }
 
 // sendAskQuestionPrompt renders one question (by index) from the AskUserQuestion list.
-// qIdx is the 0-based index of the question to display.
-func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int) {
+// qIdx is the 0-based index of the question to display. turnTag is an optional
+// turn marker prefix (see Engine.turnTag) prepended to the text renderings.
+func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int, turnTag string) {
 	if qIdx >= len(questions) {
 		return
 	}
@@ -12504,6 +12615,7 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 	// Try inline buttons (Telegram)
 	if bs, ok := p.(InlineButtonSender); ok {
 		var textBuf strings.Builder
+		textBuf.WriteString(turnTag)
 		textBuf.WriteString("❓ *")
 		textBuf.WriteString(q.Question)
 		textBuf.WriteString("*")
@@ -12544,6 +12656,7 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 
 	// Plain text fallback
 	var sb strings.Builder
+	sb.WriteString(turnTag)
 	sb.WriteString("❓ **")
 	sb.WriteString(q.Question)
 	sb.WriteString("**")

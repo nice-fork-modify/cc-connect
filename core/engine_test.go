@@ -3996,7 +3996,7 @@ func TestHandleMessage_AutoResetOnIdle_RotatesToNewSession(t *testing.T) {
 	if !strings.Contains(sent[0], "Session auto-reset") {
 		t.Fatalf("first reply = %q, want auto-reset notice", sent[0])
 	}
-	if got := sent[len(sent)-1]; got != "fresh reply" {
+	if got := sent[len(sent)-1]; got != "[#1 ✅] fresh reply" {
 		t.Fatalf("final reply = %q, want fresh reply", got)
 	}
 }
@@ -7110,7 +7110,7 @@ func TestBuildAskQuestionResponse(t *testing.T) {
 func TestSendAskQuestionPrompt_CardPlatform(t *testing.T) {
 	e := newTestEngine()
 	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
-	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0)
+	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0, "")
 
 	if len(p.sentCards) != 1 {
 		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
@@ -7129,7 +7129,7 @@ func TestSendAskQuestionPrompt_CardPlatform_MultiQuestion_ShowsIndex(t *testing.
 	e := newTestEngine()
 	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	qs := testMultiQuestions()
-	e.sendAskQuestionPrompt(p, "ctx", qs, 0)
+	e.sendAskQuestionPrompt(p, "ctx", qs, 0, "")
 
 	if len(p.sentCards) != 1 {
 		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
@@ -7143,7 +7143,7 @@ func TestSendAskQuestionPrompt_CardPlatform_MultiQuestion_ShowsIndex(t *testing.
 func TestSendAskQuestionPrompt_InlineButtonPlatform(t *testing.T) {
 	e := newTestEngine()
 	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
-	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0)
+	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0, "")
 
 	if len(p.buttonRows) != 3 {
 		t.Fatalf("expected 3 button rows, got %d", len(p.buttonRows))
@@ -7156,7 +7156,7 @@ func TestSendAskQuestionPrompt_InlineButtonPlatform(t *testing.T) {
 func TestSendAskQuestionPrompt_PlainPlatform(t *testing.T) {
 	e := newTestEngine()
 	p := &stubPlatformEngine{n: "plain"}
-	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0)
+	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0, "")
 
 	if len(p.sent) != 1 {
 		t.Fatal("expected 1 message")
@@ -9841,10 +9841,11 @@ func TestIssue814_QueuedMessageAfterCleanEventResult_UsesOwnReplyCtx(t *testing.
 		evs := p.recordedEvents()
 		var sawA, sawB bool
 		for _, ev := range evs {
-			if ev.content == "response-A" {
+			// Content carries the turn marker prefix (e.g. "[#1 ✅] ").
+			if strings.HasSuffix(ev.content, "response-A") {
 				sawA = true
 			}
-			if ev.content == "response-B" {
+			if strings.HasSuffix(ev.content, "response-B") {
 				sawB = true
 			}
 		}
@@ -9864,12 +9865,12 @@ func TestIssue814_QueuedMessageAfterCleanEventResult_UsesOwnReplyCtx(t *testing.
 	// (or vice versa) — the symptom in #814 — the assertions below
 	// fire.
 	for _, ev := range p.recordedEvents() {
-		switch ev.content {
-		case "response-A":
+		switch {
+		case strings.HasSuffix(ev.content, "response-A"):
 			if ev.replyCtx != "ctx-A" {
 				t.Errorf("turn-A reply used replyCtx=%v, want ctx-A", ev.replyCtx)
 			}
-		case "response-B":
+		case strings.HasSuffix(ev.content, "response-B"):
 			if ev.replyCtx != "ctx-B" {
 				t.Errorf("turn-B reply used replyCtx=%v, want ctx-B (regression for #814: msg-B's reply quoted msg-A)", ev.replyCtx)
 			}
@@ -11331,7 +11332,7 @@ func TestHandleMessageBusyRecalledCurrentStopsAndProcessesNewMessage(t *testing.
 	})
 
 	sent := waitForPlatformSend(&p.stubPlatformEngine, 1, 3*time.Second)
-	if len(sent) == 0 || sent[0] != "new message processed" {
+	if len(sent) == 0 || sent[0] != "[#1 ✅] new message processed" {
 		t.Fatalf("sent = %v, want new message processed", sent)
 	}
 	for _, line := range sent {
@@ -14469,7 +14470,7 @@ func TestHandleMessage_InstantReply_SendsConfirmationWhenEnabled(t *testing.T) {
 	}
 
 	sent := p.getSent()
-	if sent[0] != "🤔 Thinking..." {
+	if sent[0] != "[#1 ⏳] 🤔 Thinking..." {
 		t.Fatalf("first reply = %q, want instant reply '🤔 Thinking...'", sent[0])
 	}
 }
@@ -14506,7 +14507,7 @@ func TestHandleMessage_InstantReply_UsesDefaultI18nWhenContentEmpty(t *testing.T
 	}
 
 	sent := p.getSent()
-	if sent[0] != "⏳ 处理中..." {
+	if sent[0] != "[#1 ⏳] ⏳ 处理中..." {
 		t.Fatalf("first reply = %q, want i18n default '⏳ 处理中...'", sent[0])
 	}
 }
@@ -14547,7 +14548,7 @@ func TestHandleMessage_InstantReply_SkippedWhenDisabled(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("sent messages = %d, want exactly 1 (no instant reply), got: %v", len(sent), sent)
 	}
-	if sent[0] != "agent reply" {
+	if sent[0] != "[#1 ✅] agent reply" {
 		t.Fatalf("first reply = %q, want 'agent reply'", sent[0])
 	}
 }
@@ -14616,7 +14617,7 @@ func TestHandleMessage_InstantReply_SentWhenStreamingCardFails(t *testing.T) {
 	}
 
 	sent := p.getSent()
-	if sent[0] != "🤔 Thinking..." {
+	if sent[0] != "[#1 ⏳] 🤔 Thinking..." {
 		t.Fatalf("first reply = %q, want instant reply when card creation fails", sent[0])
 	}
 }

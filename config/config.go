@@ -203,6 +203,7 @@ type DisplayConfig struct {
 	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
 	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 	HideAgentFooter      *bool   `toml:"hide_agent_footer"`      // strip agent-emitted model/token footer lines; default false
+	TurnTag              *bool   `toml:"turn_tag"`               // prefix bot output with a turn marker like "[#1 ⏳] "; default true
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -1004,6 +1005,19 @@ func EffectiveDisplay(cfg *Config, proj *ProjectConfig) (mode string, thinkingMe
 	)
 
 	return
+}
+
+// EffectiveTurnTag returns whether bot output is prefixed with a turn marker
+// such as "[#1 ⏳] ".
+// Resolution: project [display].turn_tag > global [display].turn_tag > default true.
+func EffectiveTurnTag(cfg *Config, proj *ProjectConfig) bool {
+	if proj != nil && proj.Display != nil && proj.Display.TurnTag != nil {
+		return *proj.Display.TurnTag
+	}
+	if cfg != nil && cfg.Display.TurnTag != nil {
+		return *cfg.Display.TurnTag
+	}
+	return true
 }
 
 // EffectiveHistoryMaxLen returns the per-entry /history truncation length.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -591,6 +592,257 @@ func TestStreamPreview_UnfreezeBypassesThrottleOnFirstChunk(t *testing.T) {
 	}
 }
 
+// mockMediaAttacherPlatform adds PreviewMediaAttacher to mockCleanerPlatform,
+// simulating a platform like Telegram that can convert an existing preview
+// message into a media message via AttachPreviewMedia.
+type mockMediaAttacherPlatform struct {
+	mockCleanerPlatform
+	maxCaptionLen int
+	attachErr     error
+	attachCalls   int
+	lastHandle    any
+	lastCaption   string
+	lastImg       ImageAttachment
+}
+
+func (m *mockMediaAttacherPlatform) AttachPreviewMedia(_ context.Context, handle any, img ImageAttachment, caption string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.attachCalls++
+	m.lastHandle = handle
+	m.lastCaption = caption
+	m.lastImg = img
+	if m.attachErr != nil {
+		return 0, m.attachErr
+	}
+	return m.maxCaptionLen, nil
+}
+
+func TestStreamPreview_AttachMedia_Success(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{maxCaptionLen: 1024}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	img := ImageAttachment{MimeType: "image/png", Data: []byte("fake-bytes"), FileName: "shot.png"}
+	ok, err := sp.attachMedia(context.Background(), img)
+	if err != nil {
+		t.Fatalf("attachMedia returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("attachMedia should return true on first successful merge")
+	}
+
+	mp.mu.Lock()
+	calls := mp.attachCalls
+	caption := mp.lastCaption
+	gotImg := mp.lastImg
+	mp.mu.Unlock()
+
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 AttachPreviewMedia call, got %d", calls)
+	}
+	if caption != "Hello World" {
+		t.Fatalf("caption passed to AttachPreviewMedia = %q, want %q", caption, "Hello World")
+	}
+	if string(gotImg.Data) != "fake-bytes" {
+		t.Fatalf("image passed to AttachPreviewMedia = %#v, want fake-bytes payload", gotImg)
+	}
+
+	sp.mu.Lock()
+	mediaAttached := sp.mediaAttached
+	maxCaptionLen := sp.maxCaptionLen
+	sp.mu.Unlock()
+	if !mediaAttached {
+		t.Fatal("sp.mediaAttached should be true after successful attachMedia")
+	}
+	if maxCaptionLen != 1024 {
+		t.Fatalf("sp.maxCaptionLen = %d, want 1024", maxCaptionLen)
+	}
+
+	// A second attach attempt in the same turn must fall back (one media slot
+	// per anchor message; no album support), without calling the platform again.
+	ok2, err2 := sp.attachMedia(context.Background(), img)
+	if err2 != nil || ok2 {
+		t.Fatalf("second attachMedia in same turn = (%v, %v), want (false, nil)", ok2, err2)
+	}
+	mp.mu.Lock()
+	calls2 := mp.attachCalls
+	mp.mu.Unlock()
+	if calls2 != 1 {
+		t.Fatalf("expected AttachPreviewMedia to NOT be called again, total calls = %d", calls2)
+	}
+}
+
+func TestStreamPreview_AttachMedia_FallbackNoAnchor(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{maxCaptionLen: 1024}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	// No appendText yet: previewMsgID is nil, there is no anchor to merge into.
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+
+	ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")})
+	if err != nil || ok {
+		t.Fatalf("attachMedia with no anchor = (%v, %v), want (false, nil)", ok, err)
+	}
+	mp.mu.Lock()
+	calls := mp.attachCalls
+	mp.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("AttachPreviewMedia should not be called with no anchor, got %d calls", calls)
+	}
+}
+
+func TestStreamPreview_AttachMedia_FallbackDegraded(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{maxCaptionLen: 1024}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	// Simulate compact mode's tool-boundary freeze+detach: the anchor is gone
+	// (degraded) before the image arrives.
+	sp.freeze()
+
+	ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")})
+	if err != nil || ok {
+		t.Fatalf("attachMedia on frozen/degraded preview = (%v, %v), want (false, nil)", ok, err)
+	}
+	mp.mu.Lock()
+	calls := mp.attachCalls
+	mp.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("AttachPreviewMedia should not be called on a degraded preview, got %d calls", calls)
+	}
+}
+
+func TestStreamPreview_AttachMedia_FallbackNoInterface(t *testing.T) {
+	// mockUpdaterPlatform implements MessageUpdater + PreviewStarter but not
+	// PreviewMediaAttacher, matching platforms other than Telegram.
+	mp := &mockUpdaterPlatform{}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")})
+	if err != nil || ok {
+		t.Fatalf("attachMedia on platform without PreviewMediaAttacher = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+func TestStreamPreview_AttachMedia_Error(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{attachErr: errors.New("telegram: boom")}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")})
+	if err == nil || ok {
+		t.Fatalf("attachMedia with platform error = (%v, %v), want (false, non-nil error)", ok, err)
+	}
+
+	sp.mu.Lock()
+	mediaAttached := sp.mediaAttached
+	sp.mu.Unlock()
+	if mediaAttached {
+		t.Fatal("sp.mediaAttached must stay false when AttachPreviewMedia fails")
+	}
+}
+
+// TestStreamPreview_FinishOverflowSplitsFollowUp is the regression test for
+// the caption-overflow path: once an image has been merged into the anchor,
+// finish() must never truncate-and-drop content when the final text exceeds
+// the platform's caption limit. Instead, the part that fits (cut at a natural
+// break) stays the caption, and the remainder is delivered as exactly one
+// follow-up message via platform.Send — never a delete-and-resend of the
+// anchor.
+func TestStreamPreview_FinishOverflowSplitsFollowUp(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{maxCaptionLen: 20}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")})
+	if err != nil || !ok {
+		t.Fatalf("attachMedia = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	finalText := "This is a paragraph that is much longer than twenty characters and must overflow the caption limit."
+	finishOk := sp.finish(finalText, "")
+	if !finishOk {
+		t.Fatal("finish should return true when the anchor is still live")
+	}
+
+	msgs := mp.getMessages()
+	if len(msgs) == 0 {
+		t.Fatal("expected at least one update message for the caption head")
+	}
+	lastCaptionMsg := msgs[len(msgs)-1]
+	captionBody := strings.TrimPrefix(lastCaptionMsg, "update:")
+	if len([]rune(captionBody)) > 20 {
+		t.Fatalf("caption update exceeds maxCaptionLen: %q (%d runes)", captionBody, len([]rune(captionBody)))
+	}
+	if !strings.HasPrefix(finalText, captionBody) {
+		t.Fatalf("caption body %q is not a prefix of finalText %q (content was altered, not just split)", captionBody, finalText)
+	}
+
+	sent := mp.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("expected exactly 1 follow-up message via Send, got %d: %#v", len(sent), sent)
+	}
+	// head + tail must reconstruct the original content (mod whitespace
+	// trimmed exactly at the break point) — no content silently dropped.
+	if !strings.HasSuffix(finalText, sent[0]) {
+		t.Fatalf("follow-up message %q is not a suffix of finalText %q (content lost)", sent[0], finalText)
+	}
+
+	// Deletion must never happen for an anchor carrying merged media, even on
+	// the overflow path.
+	mp.mu.Lock()
+	deletedCount := len(mp.deleted)
+	mp.mu.Unlock()
+	if deletedCount != 0 {
+		t.Fatalf("expected no delete calls on overflow finish, got %d", deletedCount)
+	}
+}
+
+// TestStreamPreview_DiscardAfterMediaAttachedKeepsAnchor is the regression
+// test for the discard() edge case explicitly called out in the design: once
+// an image has been merged into the anchor, discard() (used for NO_REPLY,
+// EventError, and timeouts) must not delete the anchor, or the image the user
+// already saw would be lost along with it.
+func TestStreamPreview_DiscardAfterMediaAttachedKeepsAnchor(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{maxCaptionLen: 1024}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")})
+	if err != nil || !ok {
+		t.Fatalf("attachMedia = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	sp.discard()
+
+	mp.mu.Lock()
+	deletedCount := len(mp.deleted)
+	mp.mu.Unlock()
+	if deletedCount != 0 {
+		t.Fatalf("discard() deleted the anchor after media was merged, got %d delete calls", deletedCount)
+	}
+}
+
 // TestStreamPreview_UnfreezeIdempotent verifies that calling unfreeze() on
 // an already-active (non-degraded) preview does not crash. The engine may
 // in principle never call unfreeze() in that state, but the test guards
@@ -607,5 +859,47 @@ func TestStreamPreview_UnfreezeIdempotent(t *testing.T) {
 	}
 	if !sp.canPreview() {
 		t.Fatal("canPreview() = false after no-op unfreeze, want true")
+	}
+}
+
+// TestStreamPreview_OverflowFollowUpCarriesFramePrefix covers the interaction
+// between the caption-overflow split and the turn marker. finish() transforms
+// finalText before splitting it, so the marker ends up inside the caption head
+// and the tail is left bare. The follow-up belongs to the same turn as the
+// anchor, so it must be re-prefixed — otherwise a long answer that merged an
+// image emits one unlabelled message, which is exactly what the turn marker
+// exists to prevent.
+func TestStreamPreview_OverflowFollowUpCarriesFramePrefix(t *testing.T) {
+	mp := &mockMediaAttacherPlatform{maxCaptionLen: 30}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+
+	tag := &turnTagHolder{}
+	tag.set("[#4 ⏳] ")
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), tag.prefixRenderer(func(s string) string { return s }))
+	sp.framePrefix = tag.get
+
+	sp.appendText("hi")
+	time.Sleep(100 * time.Millisecond)
+
+	if ok, err := sp.attachMedia(context.Background(), ImageAttachment{Data: []byte("x")}); err != nil || !ok {
+		t.Fatalf("attachMedia = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	tag.set("[#4 ✅] ")
+	body := "First sentence stays in the caption. Second sentence has to overflow into the follow-up message because it does not fit."
+	if !sp.finish(body, "") {
+		t.Fatal("finish should return true when the anchor is still live")
+	}
+
+	sent := mp.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("expected exactly 1 follow-up message, got %d: %#v", len(sent), sent)
+	}
+	if !strings.HasPrefix(sent[0], "[#4 ✅] ") {
+		t.Fatalf("follow-up = %q, want it to carry the turn marker", sent[0])
+	}
+	// The marker is added, not duplicated, and no content is lost.
+	if !strings.HasSuffix(body, strings.TrimPrefix(sent[0], "[#4 ✅] ")) {
+		t.Fatalf("follow-up body %q is not a suffix of %q (content altered)", sent[0], body)
 	}
 }

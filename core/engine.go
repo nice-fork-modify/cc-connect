@@ -588,11 +588,20 @@ type interactiveState struct {
 	approveAll               bool            // when true, auto-approve all permission requests for this session
 	fromVoice                bool            // true if current turn originated from voice transcription
 	sideText                 string
-	deleteMode               *deleteModeState
-	modelSwitch              *modelSwitchState
-	pendingProviderAdd       *pendingProviderAddState
-	lastAutoCompressAt       time.Time
-	lastAutoCompressTokens   int
+
+	// activePreview is the streamPreview owned by the turn currently running in
+	// processInteractiveEvents, or nil when no turn is in flight. Side-channel
+	// image sends (SendToSessionWithOptions / SendToSessionInWorkDir) read this
+	// under mu to try merging an image into the turn's anchor message instead
+	// of sending it as a separate message. It is set right after the preview
+	// is created (and again when a queued message starts the next turn in the
+	// same loop) and cleared when processInteractiveEvents returns.
+	activePreview          *streamPreview
+	deleteMode             *deleteModeState
+	modelSwitch            *modelSwitchState
+	pendingProviderAdd     *pendingProviderAddState
+	lastAutoCompressAt     time.Time
+	lastAutoCompressTokens int
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -5659,6 +5668,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, previewTag.prefixRenderer(workspaceRenderer))
+	sp.framePrefix = previewTag.get
+	// state.mu is already held here (locked at the top of this function, just
+	// above at line 5409); it is only released a few lines below. Do not
+	// re-lock it — sync.Mutex is not reentrant, and a nested Lock() here would
+	// deadlock this goroutine against itself.
+	state.activePreview = sp
+	defer func() {
+		state.mu.Lock()
+		state.activePreview = nil
+		state.mu.Unlock()
+	}()
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	// A queued message hands its ack message over here; the preview then edits
 	// that message instead of opening a new one. Consume it so a later turn on
@@ -6901,9 +6921,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				previewTag = &turnTagHolder{}
 				previewTag.set(e.turnTag(turnSeq, turnIconWorking))
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, previewTag.prefixRenderer(queuedRenderer))
+				sp.framePrefix = previewTag.get
 				// Reuse the queue ack as this turn's preview message so the user
 				// sees one message evolve instead of a second bot message.
 				sp.adoptHandle(queued.ackHandle, queued.ackText)
+				state.mu.Lock()
+				state.activePreview = sp
+				state.mu.Unlock()
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
 
 				// Reset streaming card state for the next turn
@@ -12155,6 +12179,9 @@ func (e *Engine) SendToSessionWithOptions(sessionKey, message string, images []I
 		if err := e.waitOutgoing(p); err != nil {
 			return err
 		}
+		if e.tryAttachPreviewMedia(state, img) {
+			continue
+		}
 		img.Caption = imageCaption // loop copy; the caller's slice is untouched
 		if err := imageSender.SendImage(e.ctx, replyCtx, img); err != nil {
 			return err
@@ -12170,6 +12197,37 @@ func (e *Engine) SendToSessionWithOptions(sessionKey, message string, images []I
 		}
 	}
 	return nil
+}
+
+// tryAttachPreviewMedia attempts to merge img into the anchor message of the
+// turn currently running on state (if any), instead of sending it as a
+// separate message. It returns true when the merge succeeded, in which case
+// the caller must skip its normal SendImage call for this image.
+//
+// This only ever succeeds once per turn (a single editMessageMedia-style call
+// replaces one media slot, so a second image in the same turn cannot also be
+// merged) and only when the platform opts in via PreviewMediaAttacher and the
+// turn's preview is still a live, non-degraded anchor — see
+// streamPreview.attachMedia for the full eligibility check. In every other
+// case (no turn in flight, no anchor, platform unsupported, already merged,
+// frozen/detached/degraded) it returns false and the caller falls back to the
+// original behavior of sending the image as its own message.
+func (e *Engine) tryAttachPreviewMedia(state *interactiveState, img ImageAttachment) bool {
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	sp := state.activePreview
+	state.mu.Unlock()
+	if sp == nil {
+		return false
+	}
+	ok, err := sp.attachMedia(e.ctx, img)
+	if err != nil {
+		slog.Debug("stream preview: attach media failed, falling back to separate image send", "error", err)
+		return false
+	}
+	return ok
 }
 
 type sendTarget struct {
@@ -12252,6 +12310,9 @@ func (e *Engine) SendToSessionInWorkDir(sessionKey, message string, images []Ima
 	for _, img := range images {
 		if err := e.waitOutgoing(target.platform); err != nil {
 			return err
+		}
+		if e.tryAttachPreviewMedia(target.state, img) {
+			continue
 		}
 		img.Caption = imageCaption // loop copy; the caller's slice is untouched
 		if err := imageSender.SendImage(e.ctx, target.replyCtx, img); err != nil {

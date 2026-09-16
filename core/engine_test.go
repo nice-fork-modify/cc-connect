@@ -800,6 +800,142 @@ func TestEngineSendToSessionWithAttachments_DisabledByConfig(t *testing.T) {
 	}
 }
 
+// stubMediaAttacherPlatform adds PreviewMediaAttacher to stubMediaPlatform, so
+// tests can exercise the SendToSessionWithOptions/SendToSessionInWorkDir
+// image-merge path (tryAttachPreviewMedia) against a platform that opts in,
+// like Telegram.
+type stubMediaAttacherPlatform struct {
+	stubMediaPlatform
+	maxCaptionLen int
+	attachErr     error
+	attachCalls   int
+	lastCaption   string
+}
+
+func (p *stubMediaAttacherPlatform) AttachPreviewMedia(_ context.Context, _ any, _ ImageAttachment, caption string) (int, error) {
+	p.attachCalls++
+	p.lastCaption = caption
+	if p.attachErr != nil {
+		return 0, p.attachErr
+	}
+	return p.maxCaptionLen, nil
+}
+
+// TestEngineTryAttachPreviewMedia covers tryAttachPreviewMedia's fallback and
+// merge branches directly: no state, no active turn, and a live anchor that
+// accepts the merge.
+func TestEngineTryAttachPreviewMedia(t *testing.T) {
+	t.Run("nil state falls back", func(t *testing.T) {
+		p := &stubMediaAttacherPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+		e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+		if e.tryAttachPreviewMedia(nil, ImageAttachment{Data: []byte("x")}) {
+			t.Fatal("expected false with nil state")
+		}
+		if p.attachCalls != 0 {
+			t.Fatalf("AttachPreviewMedia should not be called, got %d calls", p.attachCalls)
+		}
+	})
+
+	t.Run("no turn in flight falls back", func(t *testing.T) {
+		p := &stubMediaAttacherPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+		e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+		state := &interactiveState{platform: p, replyCtx: "ctx-1"} // activePreview left nil
+
+		if e.tryAttachPreviewMedia(state, ImageAttachment{Data: []byte("x")}) {
+			t.Fatal("expected false when no turn/anchor is active")
+		}
+		if p.attachCalls != 0 {
+			t.Fatalf("AttachPreviewMedia should not be called, got %d calls", p.attachCalls)
+		}
+	})
+
+	t.Run("live anchor merges", func(t *testing.T) {
+		p := &stubMediaAttacherPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}, maxCaptionLen: 1024}
+		e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+		sp := newStreamPreview(DefaultStreamPreviewCfg(), p, "ctx-1", e.ctx, nil)
+		sp.previewMsgID = "anchor-1"
+		sp.fullText = "turn so far"
+		state := &interactiveState{platform: p, replyCtx: "ctx-1", activePreview: sp}
+
+		if !e.tryAttachPreviewMedia(state, ImageAttachment{Data: []byte("x")}) {
+			t.Fatal("expected true when a live anchor accepts the merge")
+		}
+		if p.attachCalls != 1 {
+			t.Fatalf("expected exactly 1 AttachPreviewMedia call, got %d", p.attachCalls)
+		}
+		if p.lastCaption != "turn so far" {
+			t.Fatalf("caption = %q, want %q", p.lastCaption, "turn so far")
+		}
+	})
+
+	t.Run("attacher error falls back", func(t *testing.T) {
+		p := &stubMediaAttacherPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}, attachErr: errors.New("boom")}
+		e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+		sp := newStreamPreview(DefaultStreamPreviewCfg(), p, "ctx-1", e.ctx, nil)
+		sp.previewMsgID = "anchor-1"
+		state := &interactiveState{platform: p, replyCtx: "ctx-1", activePreview: sp}
+
+		if e.tryAttachPreviewMedia(state, ImageAttachment{Data: []byte("x")}) {
+			t.Fatal("expected false when AttachPreviewMedia errors")
+		}
+	})
+}
+
+// TestEngineSendToSessionWithOptions_MergesImageIntoActivePreview is the
+// integration-level test proving the image loop in SendToSessionWithOptions
+// actually consults state.activePreview and skips SendImage on a successful
+// merge, instead of always sending the image as a separate message.
+func TestEngineSendToSessionWithOptions_MergesImageIntoActivePreview(t *testing.T) {
+	p := &stubMediaAttacherPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}, maxCaptionLen: 1024}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sp := newStreamPreview(DefaultStreamPreviewCfg(), p, "ctx-1", e.ctx, nil)
+	sp.previewMsgID = "anchor-1"
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform:      p,
+		replyCtx:      "ctx-1",
+		activePreview: sp,
+	}
+
+	err := e.SendToSessionWithOptions("session-1", "", []ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"}}, nil, SendOptions{})
+	if err != nil {
+		t.Fatalf("SendToSessionWithOptions returned error: %v", err)
+	}
+
+	if len(p.images) != 0 {
+		t.Fatalf("images sent separately = %#v, want none (should have been merged)", p.images)
+	}
+	if p.attachCalls != 1 {
+		t.Fatalf("expected exactly 1 AttachPreviewMedia call, got %d", p.attachCalls)
+	}
+}
+
+// TestEngineSendToSessionWithOptions_FallsBackToSendImageWhenNoActivePreview
+// locks down the "original behavior" retreat path: when there is no turn in
+// flight (no activePreview on the session's interactiveState), images must
+// still be delivered via the platform's normal SendImage, unchanged from
+// before this feature existed.
+func TestEngineSendToSessionWithOptions_FallsBackToSendImageWhenNoActivePreview(t *testing.T) {
+	p := &stubMediaAttacherPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}, maxCaptionLen: 1024}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform: p,
+		replyCtx: "ctx-1",
+	}
+
+	err := e.SendToSessionWithOptions("session-1", "", []ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"}}, nil, SendOptions{})
+	if err != nil {
+		t.Fatalf("SendToSessionWithOptions returned error: %v", err)
+	}
+
+	if len(p.images) != 1 || p.images[0].FileName != "chart.png" {
+		t.Fatalf("images = %#v, want the image sent via SendImage", p.images)
+	}
+	if p.attachCalls != 0 {
+		t.Fatalf("AttachPreviewMedia should not be called with no active turn, got %d calls", p.attachCalls)
+	}
+}
+
 func TestEngineSendToSessionWithAttachments_MultiWorkspaceRawSessionKey(t *testing.T) {
 	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)

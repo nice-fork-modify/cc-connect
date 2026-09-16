@@ -47,6 +47,16 @@ type streamPreview struct {
 	previewMsgID      any  // platform-specific ID for the preview message (returned by SendPreviewStart)
 	degraded          bool // if true, stop trying (platform doesn't support it or permanent error)
 
+	mediaAttached bool // true once attachMedia() has merged an image into previewMsgID
+	maxCaptionLen int  // caption length limit reported by AttachPreviewMedia; 0 until mediaAttached
+
+	// framePrefix returns the per-frame prefix (the turn marker) that transform
+	// injects into every frame. The caption-overflow follow-up needs it on its
+	// own: its text is split out of an already-transformed string, so it must be
+	// re-prefixed without re-running the content renderer over content that has
+	// already been through it. nil when the preview has no marker.
+	framePrefix func() string
+
 	timer     *time.Timer
 	timerStop chan struct{} // closed when preview ends
 
@@ -145,6 +155,24 @@ type PreviewFinishPreference interface {
 	KeepPreviewOnFinish() bool
 }
 
+// PreviewMediaAttacher is an optional interface for platforms that can turn an
+// already-sent editable preview message into a media message in place (e.g.
+// Telegram's editMessageMedia, which can add a photo to a message that was
+// previously text-only). AttachPreviewMedia converts the message identified
+// by handle into one carrying img, with caption as the media's caption, and
+// returns the platform's maximum caption length so streamPreview can keep
+// future frames within it.
+//
+// This is a one-shot operation per message: a single editMessageMedia call
+// replaces one media slot, so it cannot be used to build an album. Once
+// attached, subsequent UpdateMessage calls on the same handle must edit the
+// caption instead of the message text; implementations are responsible for
+// remembering (on the handle) that the message is now a media message so
+// UpdateMessage can route correctly without an extra failed API round trip.
+type PreviewMediaAttacher interface {
+	AttachPreviewMedia(ctx context.Context, handle any, img ImageAttachment, caption string) (maxCaptionLen int, err error)
+}
+
 func newStreamPreview(cfg StreamPreviewCfg, p Platform, replyCtx any, ctx context.Context, transform func(string) string) *streamPreview {
 	return &streamPreview{
 		cfg:       cfg,
@@ -175,6 +203,20 @@ func (sp *streamPreview) canPreview() bool {
 	return ok
 }
 
+// effectiveMaxCharsLocked returns the truncation limit for intermediate
+// preview frames: the configured MaxChars, further capped by the platform's
+// caption length once attachMedia() has merged a photo into previewMsgID.
+// Must hold sp.mu.
+func (sp *streamPreview) effectiveMaxCharsLocked() int {
+	max := sp.cfg.MaxChars
+	if sp.mediaAttached && sp.maxCaptionLen > 0 {
+		if max <= 0 || sp.maxCaptionLen < max {
+			max = sp.maxCaptionLen
+		}
+	}
+	return max
+}
+
 // appendText adds new text content and triggers a throttled flush if needed.
 func (sp *streamPreview) appendText(text string) {
 	sp.mu.Lock()
@@ -187,7 +229,7 @@ func (sp *streamPreview) appendText(text string) {
 	sp.fullText += text
 
 	displayText := sp.fullText
-	maxChars := sp.cfg.MaxChars
+	maxChars := sp.effectiveMaxCharsLocked()
 	if maxChars > 0 && len([]rune(displayText)) > maxChars {
 		displayText = string([]rune(displayText)[:maxChars]) + "…"
 	}
@@ -223,7 +265,7 @@ func (sp *streamPreview) scheduleFlushLocked(delay time.Duration) {
 			return
 		}
 		displayText := sp.fullText
-		maxChars := sp.cfg.MaxChars
+		maxChars := sp.effectiveMaxCharsLocked()
 		if maxChars > 0 && len([]rune(displayText)) > maxChars {
 			displayText = string([]rune(displayText)[:maxChars]) + "…"
 		}
@@ -304,7 +346,7 @@ func (sp *streamPreview) freeze() {
 	if sp.previewMsgID != nil && !sp.degraded {
 		if updater, ok := sp.platform.(MessageUpdater); ok {
 			text := sp.fullText
-			maxChars := sp.cfg.MaxChars
+			maxChars := sp.effectiveMaxCharsLocked()
 			if maxChars > 0 && len([]rune(text)) > maxChars {
 				text = string([]rune(text)[:maxChars]) + "…"
 			}
@@ -386,6 +428,43 @@ func (sp *streamPreview) adoptHandle(handle any, ackText string) {
 	sp.lastSentAt = time.Time{}
 }
 
+// attachMedia merges img into the anchor message this preview owns, using the
+// current accumulated text (rendered through transform, same as any other
+// frame) as the resulting media's caption. It is a one-shot operation per
+// turn: once mediaAttached is true, or when there is no active, non-degraded
+// anchor, or when the platform does not implement PreviewMediaAttacher, it
+// returns (false, nil) so the caller falls back to sending the image as a
+// separate message — the original behavior.
+func (sp *streamPreview) attachMedia(ctx context.Context, img ImageAttachment) (bool, error) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if sp.degraded || sp.mediaAttached || sp.previewMsgID == nil {
+		return false, nil
+	}
+	attacher, ok := sp.platform.(PreviewMediaAttacher)
+	if !ok {
+		return false, nil
+	}
+
+	caption := sp.fullText
+	if sp.transform != nil {
+		caption = sp.transform(caption)
+	}
+
+	maxCaptionLen, err := attacher.AttachPreviewMedia(ctx, sp.previewMsgID, img, caption)
+	if err != nil {
+		return false, err
+	}
+
+	sp.mediaAttached = true
+	sp.maxCaptionLen = maxCaptionLen
+	sp.lastSentText = caption
+	sp.lastSentViaUpdate = true
+	sp.lastSentAt = time.Now()
+	return true, nil
+}
+
 // showNotice puts text on this turn's preview message: it edits the message the
 // preview already owns (e.g. an adopted queue ack), or opens a new preview
 // message when the turn does not have one yet. Returns false when the platform
@@ -446,7 +525,12 @@ func (sp *streamPreview) discard() {
 	}
 
 	if sp.previewMsgID != nil {
-		if cleaner, ok := sp.platform.(PreviewCleaner); ok {
+		if sp.mediaAttached {
+			// The anchor now carries an image the user has already seen (merged
+			// via attachMedia). Deleting it would delete that image along with
+			// the message, so leave it in place exactly as last edited instead.
+			slog.Debug("stream preview discard: skipping delete, preview carries merged media")
+		} else if cleaner, ok := sp.platform.(PreviewCleaner); ok {
 			slog.Debug("stream preview discard: deleting preview")
 			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
 		}
@@ -486,7 +570,7 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 			// Try to recover degraded preview via UpdateMessage before falling back to delete
 			if finalText != "" {
 				if updater, ok := sp.platform.(MessageUpdater); ok {
-					if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText); err == nil {
+					if err := sp.updateFinalLocked(updater, finalText); err == nil {
 						if sp.pendingStatus != "" {
 							if statusUpdater, ok := sp.platform.(PreviewStatusUpdater); ok {
 								statusUpdater.SetPreviewStatus(sp.previewMsgID, sp.pendingStatus)
@@ -498,7 +582,9 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 					}
 				}
 			}
-			if cleaner, ok := sp.platform.(PreviewCleaner); ok {
+			if sp.mediaAttached {
+				slog.Debug("stream preview finish: skipping delete of stale preview, carries merged media")
+			} else if cleaner, ok := sp.platform.(PreviewCleaner); ok {
 				slog.Debug("stream preview finish: deleting stale preview (degraded)")
 				_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
 			}
@@ -512,8 +598,10 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 		keepPreview = pref.KeepPreviewOnFinish()
 	}
 
-	// If platform wants to delete the preview and send fresh, let it.
-	if cleaner, ok := sp.platform.(PreviewCleaner); ok && !keepPreview {
+	// If platform wants to delete the preview and send fresh, let it — unless
+	// the anchor carries a merged image, in which case deleting it would take
+	// the image down too; keep editing it in place instead.
+	if cleaner, ok := sp.platform.(PreviewCleaner); ok && !keepPreview && !sp.mediaAttached {
 		slog.Debug("stream preview finish: deleting preview (PreviewCleaner)")
 		_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
 		return false
@@ -569,11 +657,14 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 		finalText = appendReplyFooter(finalText, statusFooter)
 	}
 
-	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText); err != nil {
+	if err := sp.updateFinalLocked(updater, finalText); err != nil {
 		slog.Debug("stream preview finish: final update FAILED, cleaning up preview", "error", err)
-		// Update failed (e.g. text too long for platform edit API).
-		// Try to delete the stale preview so caller can send a fresh message.
-		if cleaner, ok := sp.platform.(PreviewCleaner); ok {
+		// Update failed (e.g. text too long for platform edit API). Try to
+		// delete the stale preview so caller can send a fresh message — unless
+		// it carries a merged image, which the delete would take down too.
+		if sp.mediaAttached {
+			slog.Debug("stream preview finish: skipping delete after failed update, carries merged media")
+		} else if cleaner, ok := sp.platform.(PreviewCleaner); ok {
 			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
 		}
 		return false
@@ -585,6 +676,91 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	}
 	slog.Debug("stream preview finish: success via UpdateMessage")
 	return true
+}
+
+// updateFinalLocked pushes finalText to the anchor message via UpdateMessage.
+// When the anchor carries a merged image (mediaAttached) and finalText no
+// longer fits the platform's caption limit, it does not truncate content:
+// the part that fits stays the caption (split at a natural break), and the
+// remainder is delivered as a single follow-up message via platform.Send.
+// This keeps the anchor message editable in place rather than deleting and
+// resending it, which would shift the message and lose the merged image.
+// Must hold sp.mu.
+func (sp *streamPreview) updateFinalLocked(updater MessageUpdater, finalText string) error {
+	if !sp.mediaAttached || sp.maxCaptionLen <= 0 || len([]rune(finalText)) <= sp.maxCaptionLen {
+		return updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText)
+	}
+
+	head, tail := splitCaptionOverflow(finalText, sp.maxCaptionLen)
+	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, head); err != nil {
+		return err
+	}
+	if tail != "" {
+		// The follow-up belongs to the same turn as the anchor, so it carries the
+		// same marker — on the first chunk only, like every other split send.
+		if sp.framePrefix != nil {
+			tail = sp.framePrefix() + tail
+		}
+		for _, chunk := range SplitMessageCodeFenceAware(tail, maxPlatformMessageLen) {
+			if err := sp.platform.Send(sp.ctx, sp.replyCtx, chunk); err != nil {
+				slog.Debug("stream preview finish: overflow follow-up send failed", "error", err)
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// splitCaptionOverflow splits text so head fits within maxLen runes, cutting
+// at the latest natural break inside that window: paragraph break, then line
+// break, then sentence end, then whitespace. Only when none of those exist
+// does it fall back to a hard cut at maxLen — it never cuts mid-word if a
+// better break point is available, and it never drops any content (head+tail
+// reconstructs text exactly, modulo surrounding whitespace trimmed at the
+// break point).
+func splitCaptionOverflow(text string, maxLen int) (head, tail string) {
+	runes := []rune(text)
+	if maxLen <= 0 || len(runes) <= maxLen {
+		return text, ""
+	}
+
+	window := runes[:maxLen]
+
+	// lastIndexOf returns the rune index just after the last occurrence of sep
+	// within window, or -1 if sep does not occur (or would leave an empty head).
+	lastIndexOf := func(sep string) int {
+		sepRunes := []rune(sep)
+		for i := len(window) - len(sepRunes); i > 0; i-- {
+			if string(window[i:i+len(sepRunes)]) == sep {
+				return i + len(sepRunes)
+			}
+		}
+		return -1
+	}
+
+	candidates := [][]string{
+		{"\n\n"},
+		{"\n"},
+		{"。", "！", "？", ". ", "! ", "? "},
+		{" "},
+	}
+	for _, seps := range candidates {
+		best := -1
+		for _, sep := range seps {
+			if at := lastIndexOf(sep); at > best {
+				best = at
+			}
+		}
+		if best > 0 {
+			h := strings.TrimRight(string(window[:best]), " \t\n")
+			t := strings.TrimLeft(string(runes[best:]), " \t\n")
+			if h != "" {
+				return h, t
+			}
+		}
+	}
+
+	return string(window), string(runes[maxLen:])
 }
 
 // setStatus updates the card header status of the active preview message.

@@ -44,6 +44,8 @@ type telegramBot interface {
 	SendAudio(ctx context.Context, params *tgbot.SendAudioParams) (*models.Message, error)
 	SendChatAction(ctx context.Context, params *tgbot.SendChatActionParams) (bool, error)
 	EditMessageText(ctx context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error)
+	EditMessageCaption(ctx context.Context, params *tgbot.EditMessageCaptionParams) (*models.Message, error)
+	EditMessageMedia(ctx context.Context, params *tgbot.EditMessageMediaParams) (*models.Message, error)
 	DeleteMessage(ctx context.Context, params *tgbot.DeleteMessageParams) (bool, error)
 	AnswerCallbackQuery(ctx context.Context, params *tgbot.AnswerCallbackQueryParams) (bool, error)
 	SetMyCommands(ctx context.Context, params *tgbot.SetMyCommandsParams) (bool, error)
@@ -1457,6 +1459,13 @@ type telegramPreviewHandle struct {
 	chatID    int64
 	threadID  int
 	messageID int
+	// isMedia is true once AttachPreviewMedia has converted this message from
+	// text-only into a photo message. UpdateMessage checks this flag so it
+	// calls editMessageCaption instead of editMessageText for the rest of the
+	// turn — without it, editMessageText would always fail once the message
+	// carries a photo ("there is no text in the message to edit"), and
+	// probing that on every frame would cost an extra failed API round trip.
+	isMedia bool
 }
 
 // SendPreviewStart sends a new message and returns a handle for subsequent edits.
@@ -1513,6 +1522,92 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	return &telegramPreviewHandle{chatID: rc.chatID, threadID: rc.threadID, messageID: sent.ID}, nil
 }
 
+// telegramCaptionMaxLen is Telegram's hard limit for a media message's
+// caption, introduced alongside editMessageMedia in Bot API 7.11. It is much
+// smaller than telegramMaxMessageLen (4096), which only applies to text-only
+// messages.
+const telegramCaptionMaxLen = 1024
+
+// AttachPreviewMedia converts an existing text preview message into a photo
+// message via editMessageMedia (Bot API 7.11+), carrying caption as the
+// photo's caption. It marks the handle so subsequent UpdateMessage calls edit
+// the caption instead of the message text. caption is truncated to
+// telegramCaptionMaxLen if needed — this is not the final turn text, so
+// losing the tail here is fine; streamPreview re-applies the true 1024 limit
+// (returned below) to every later frame, and the caller sends the complete
+// tail as a follow-up message once the turn's final text no longer fits.
+func (p *Platform) AttachPreviewMedia(ctx context.Context, previewHandle any, img core.ImageAttachment, caption string) (int, error) {
+	h, ok := previewHandle.(*telegramPreviewHandle)
+	if !ok {
+		return 0, fmt.Errorf("telegram: invalid preview handle type %T", previewHandle)
+	}
+	if h.isMedia {
+		return 0, fmt.Errorf("telegram: preview message already carries media")
+	}
+	bot, err := p.connectedBot("attach preview media")
+	if err != nil {
+		return 0, err
+	}
+
+	name := img.FileName
+	if name == "" {
+		name = "image"
+	}
+	html := core.MarkdownToSimpleHTML(truncateRunes(caption, telegramCaptionMaxLen))
+	media := &models.InputMediaPhoto{
+		Media:           "attach://" + name,
+		Caption:         html,
+		ParseMode:       models.ParseModeHTML,
+		MediaAttachment: bytes.NewReader(img.Data),
+	}
+	params := &tgbot.EditMessageMediaParams{
+		ChatID:    h.chatID,
+		MessageID: h.messageID,
+		Media:     media,
+	}
+	if _, err := bot.EditMessageMedia(ctx, params); err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "can't parse") {
+			slog.Warn("telegram: HTML rejected by Telegram, attaching media with plain-text caption",
+				"error", errMsg,
+				"html_prefix", truncateForLog(html, 200),
+				"html_len", len(html),
+			)
+			media.Caption = truncateRunes(caption, telegramCaptionMaxLen)
+			media.ParseMode = ""
+			// The first attempt's multipart upload already consumed
+			// MediaAttachment to EOF; a fresh reader is required for the
+			// retry or the photo would upload as empty content.
+			media.MediaAttachment = bytes.NewReader(img.Data)
+			if _, err2 := bot.EditMessageMedia(ctx, params); err2 != nil {
+				return 0, fmt.Errorf("telegram: attach preview media: %w", err2)
+			}
+		} else {
+			return 0, fmt.Errorf("telegram: attach preview media: %w", err)
+		}
+	}
+	h.isMedia = true
+	return telegramCaptionMaxLen, nil
+}
+
+// truncateRunes truncates s to at most maxLen runes, appending "…" when it
+// had to cut. Used only for the non-final AttachPreviewMedia caption above;
+// the actual head/tail split for final turn text lives in core (streamPreview
+// via PreviewMediaAttacher's returned maxCaptionLen) and never drops content.
+func truncateRunes(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	if maxLen == 1 {
+		return string(r[:1])
+	}
+	return string(r[:maxLen-1]) + "…"
+}
+
 // UpdateMessage edits an existing message identified by previewHandle.
 func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content string) error {
 	h, ok := previewHandle.(*telegramPreviewHandle)
@@ -1522,6 +1617,10 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	bot, err := p.connectedBot("update message")
 	if err != nil {
 		return err
+	}
+
+	if h.isMedia {
+		return p.updateMessageCaption(ctx, bot, h, content)
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1563,6 +1662,54 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 		return fmt.Errorf("telegram: edit message: %w", err)
 	}
 	slog.Debug("telegram: UpdateMessage HTML success")
+	return nil
+}
+
+// updateMessageCaption edits the caption of a message that AttachPreviewMedia
+// has already converted into a photo message. It mirrors UpdateMessage's
+// HTML-then-plain-text fallback and "not modified" handling, using
+// editMessageCaption instead of editMessageText since Telegram permanently
+// rejects editMessageText on a message once it carries media.
+func (p *Platform) updateMessageCaption(ctx context.Context, bot telegramBot, h *telegramPreviewHandle, content string) error {
+	html := core.MarkdownToSimpleHTML(content)
+	slog.Debug("telegram: updateMessageCaption",
+		"content_len", len(content), "html_len", len(html),
+		"content_prefix", truncateForLog(content, 80),
+		"html_prefix", truncateForLog(html, 80))
+
+	params := &tgbot.EditMessageCaptionParams{
+		ChatID:    h.chatID,
+		MessageID: h.messageID,
+		Caption:   html,
+		ParseMode: models.ParseModeHTML,
+	}
+
+	if _, err := bot.EditMessageCaption(ctx, params); err != nil {
+		errMsg := err.Error()
+		slog.Debug("telegram: updateMessageCaption HTML failed", "error", errMsg)
+		if strings.Contains(errMsg, "not modified") {
+			return nil
+		}
+		if strings.Contains(errMsg, "can't parse") {
+			slog.Warn("telegram: HTML rejected by Telegram, editing caption as plain text",
+				"method", "updateMessageCaption",
+				"error", errMsg,
+				"html_prefix", truncateForLog(html, 200),
+				"html_len", len(html),
+			)
+			params.Caption = content
+			params.ParseMode = ""
+			if _, err2 := bot.EditMessageCaption(ctx, params); err2 != nil {
+				if strings.Contains(err2.Error(), "not modified") {
+					return nil
+				}
+				return fmt.Errorf("telegram: edit message caption: %w", err2)
+			}
+			return nil
+		}
+		return fmt.Errorf("telegram: edit message caption: %w", err)
+	}
+	slog.Debug("telegram: updateMessageCaption HTML success")
 	return nil
 }
 
@@ -1876,3 +2023,4 @@ func sanitizeTelegramCommand(cmd string) string {
 }
 
 var _ core.AudioSender = (*Platform)(nil)
+var _ core.PreviewMediaAttacher = (*Platform)(nil)

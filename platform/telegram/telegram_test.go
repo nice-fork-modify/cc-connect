@@ -69,28 +69,36 @@ func (t *stubTypingTicker) C() <-chan time.Time {
 func (t *stubTypingTicker) Stop() {}
 
 type stubTelegramBot struct {
-	mu                   sync.Mutex
-	sendMessageCalls     int
-	sendPhotoCalls       int
-	sendDocumentCalls    int
-	sendVoiceCalls       int
-	sendAudioCalls       int
-	sendChatActionCalls  int
-	editMessageTextCalls int
-	deleteMessageCalls   int
-	answerCallbackCalls  int
-	setMyCommandsCalls   int
-	getFileCalls         int
-	setReactionCalls     int
+	mu                      sync.Mutex
+	sendMessageCalls        int
+	sendPhotoCalls          int
+	sendDocumentCalls       int
+	sendVoiceCalls          int
+	sendAudioCalls          int
+	sendChatActionCalls     int
+	editMessageTextCalls    int
+	deleteMessageCalls      int
+	answerCallbackCalls     int
+	setMyCommandsCalls      int
+	getFileCalls            int
+	setReactionCalls        int
+	editMessageCaptionCalls int
+	editMessageMediaCalls   int
 
-	lastSendMessageParams  *tgbot.SendMessageParams
-	lastReactionParams     *tgbot.SetMessageReactionParams
-	lastSendPhotoParams    *tgbot.SendPhotoParams
-	lastSendDocumentParams *tgbot.SendDocumentParams
+	lastSendMessageParams        *tgbot.SendMessageParams
+	lastReactionParams           *tgbot.SetMessageReactionParams
+	lastSendPhotoParams          *tgbot.SendPhotoParams
+	lastSendDocumentParams       *tgbot.SendDocumentParams
+	lastEditMessageCaptionParams *tgbot.EditMessageCaptionParams
+	lastEditMessageMediaParams   *tgbot.EditMessageMediaParams
 
-	sendErr    error
-	getFileErr error
-	file       *models.File
+	sendErr                          error
+	getFileErr                       error
+	editMessageCaptionErr            error
+	editMessageCaptionErrOnFirstCall error // returned only on the 1st EditMessageCaption call, for retry-path tests
+	editMessageMediaErr              error
+	editMessageMediaErrOnFirstCall   error // returned only on the 1st EditMessageMedia call, for retry-path tests
+	file                             *models.File
 }
 
 func newStubTelegramBot() *stubTelegramBot {
@@ -170,6 +178,50 @@ func (b *stubTelegramBot) EditMessageText(_ context.Context, _ *tgbot.EditMessag
 		return nil, b.sendErr
 	}
 	return &models.Message{ID: 99}, nil
+}
+
+func (b *stubTelegramBot) EditMessageCaption(_ context.Context, params *tgbot.EditMessageCaptionParams) (*models.Message, error) {
+	b.mu.Lock()
+	b.editMessageCaptionCalls++
+	calls := b.editMessageCaptionCalls
+	b.lastEditMessageCaptionParams = params
+	err := b.editMessageCaptionErr
+	if calls == 1 && b.editMessageCaptionErrOnFirstCall != nil {
+		err = b.editMessageCaptionErrOnFirstCall
+	}
+	b.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if b.sendErr != nil {
+		return nil, b.sendErr
+	}
+	return &models.Message{ID: 99}, nil
+}
+
+func (b *stubTelegramBot) EditMessageMedia(_ context.Context, params *tgbot.EditMessageMediaParams) (*models.Message, error) {
+	b.mu.Lock()
+	b.editMessageMediaCalls++
+	calls := b.editMessageMediaCalls
+	b.lastEditMessageMediaParams = params
+	err := b.editMessageMediaErr
+	if calls == 1 && b.editMessageMediaErrOnFirstCall != nil {
+		err = b.editMessageMediaErrOnFirstCall
+	}
+	b.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if b.sendErr != nil {
+		return nil, b.sendErr
+	}
+	return &models.Message{ID: 99}, nil
+}
+
+func (b *stubTelegramBot) editMessageMediaCallCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.editMessageMediaCalls
 }
 
 func (b *stubTelegramBot) DeleteMessage(_ context.Context, _ *tgbot.DeleteMessageParams) (bool, error) {
@@ -1309,4 +1361,189 @@ func TestSendAttachment_CaptionAndReplyParameters(t *testing.T) {
 			t.Fatalf("Caption = %q, want empty", params.Caption)
 		}
 	})
+}
+
+func TestAttachPreviewMedia_Success(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	p := &Platform{bot: stubBot}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2}
+
+	img := core.ImageAttachment{Data: []byte("png-bytes"), FileName: "shot.png"}
+	maxLen, err := p.AttachPreviewMedia(context.Background(), h, img, "hello world")
+	if err != nil {
+		t.Fatalf("AttachPreviewMedia: %v", err)
+	}
+	if maxLen != telegramCaptionMaxLen {
+		t.Fatalf("maxLen = %d, want %d", maxLen, telegramCaptionMaxLen)
+	}
+	if !h.isMedia {
+		t.Fatal("handle.isMedia should be true after a successful attach")
+	}
+	if stubBot.editMessageMediaCallCount() != 1 {
+		t.Fatalf("EditMessageMedia calls = %d, want 1", stubBot.editMessageMediaCallCount())
+	}
+
+	params := stubBot.lastEditMessageMediaParams
+	if params == nil {
+		t.Fatal("EditMessageMedia was not called")
+	}
+	if params.ChatID != h.chatID || params.MessageID != h.messageID {
+		t.Fatalf("EditMessageMediaParams target = (chatID=%v, messageID=%v), want (%v, %v)", params.ChatID, params.MessageID, h.chatID, h.messageID)
+	}
+	photo, ok := params.Media.(*models.InputMediaPhoto)
+	if !ok {
+		t.Fatalf("Media type = %T, want *models.InputMediaPhoto", params.Media)
+	}
+	if photo.Media != "attach://shot.png" {
+		t.Fatalf("Media = %q, want %q", photo.Media, "attach://shot.png")
+	}
+	if !strings.Contains(photo.Caption, "hello world") {
+		t.Fatalf("Caption = %q, want to contain %q", photo.Caption, "hello world")
+	}
+	if photo.MediaAttachment == nil {
+		t.Fatal("MediaAttachment reader is nil, upload would fail")
+	}
+}
+
+func TestAttachPreviewMedia_AlreadyMediaFails(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	p := &Platform{bot: stubBot}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2, isMedia: true}
+
+	_, err := p.AttachPreviewMedia(context.Background(), h, core.ImageAttachment{Data: []byte("x")}, "caption")
+	if err == nil {
+		t.Fatal("expected error when the handle already carries media")
+	}
+	if stubBot.editMessageMediaCallCount() != 0 {
+		t.Fatalf("EditMessageMedia should not be called, got %d calls", stubBot.editMessageMediaCallCount())
+	}
+}
+
+func TestAttachPreviewMedia_InvalidHandleType(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	p := &Platform{bot: stubBot}
+
+	_, err := p.AttachPreviewMedia(context.Background(), "not-a-handle", core.ImageAttachment{Data: []byte("x")}, "caption")
+	if err == nil {
+		t.Fatal("expected error for invalid handle type")
+	}
+}
+
+func TestAttachPreviewMedia_NotConnected(t *testing.T) {
+	p := &Platform{token: "token", httpClient: &http.Client{}}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2}
+
+	_, err := p.AttachPreviewMedia(context.Background(), h, core.ImageAttachment{Data: []byte("x")}, "caption")
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Fatalf("err = %v, want to contain %q", err, "not connected")
+	}
+}
+
+// TestAttachPreviewMedia_HTMLParseFailFallsBackToPlainText mirrors the
+// existing UpdateMessage/Send "can't parse" retry convention: if Telegram
+// rejects the HTML-converted caption, retry once with the raw plain-text
+// caption instead of failing the whole merge.
+func TestAttachPreviewMedia_HTMLParseFailFallsBackToPlainText(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	stubBot.editMessageMediaErrOnFirstCall = errors.New("Bad Request: can't parse entities")
+	p := &Platform{bot: stubBot}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2}
+
+	maxLen, err := p.AttachPreviewMedia(context.Background(), h, core.ImageAttachment{Data: []byte("x"), FileName: "a.png"}, "hello world")
+	if err != nil {
+		t.Fatalf("AttachPreviewMedia: %v", err)
+	}
+	if maxLen != telegramCaptionMaxLen {
+		t.Fatalf("maxLen = %d, want %d", maxLen, telegramCaptionMaxLen)
+	}
+	if !h.isMedia {
+		t.Fatal("handle.isMedia should be true after the retry succeeds")
+	}
+	if stubBot.editMessageMediaCallCount() != 2 {
+		t.Fatalf("EditMessageMedia calls = %d, want 2 (initial + plain-text retry)", stubBot.editMessageMediaCallCount())
+	}
+
+	params := stubBot.lastEditMessageMediaParams
+	photo, ok := params.Media.(*models.InputMediaPhoto)
+	if !ok {
+		t.Fatalf("Media type = %T, want *models.InputMediaPhoto", params.Media)
+	}
+	if photo.ParseMode != "" {
+		t.Fatalf("retry ParseMode = %q, want empty (plain text)", photo.ParseMode)
+	}
+	if photo.Caption != "hello world" {
+		t.Fatalf("retry Caption = %q, want raw plain text %q", photo.Caption, "hello world")
+	}
+	if photo.MediaAttachment == nil {
+		t.Fatal("retry MediaAttachment reader is nil, upload would fail (stale/consumed reader?)")
+	}
+}
+
+// TestUpdateMessage_RoutesToCaptionOnceMediaAttached is the regression test
+// for the no-extra-round-trip requirement: once AttachPreviewMedia has
+// converted the message into a photo, UpdateMessage must call
+// EditMessageCaption directly and must NOT call EditMessageText at all (which
+// would always fail with "there is no text in the message to edit" and cost
+// a wasted API round trip on every streaming frame for the rest of the turn).
+func TestUpdateMessage_RoutesToCaptionOnceMediaAttached(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	p := &Platform{bot: stubBot}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2, isMedia: true}
+
+	if err := p.UpdateMessage(context.Background(), h, "new caption text"); err != nil {
+		t.Fatalf("UpdateMessage: %v", err)
+	}
+
+	if stubBot.editMessageTextCalls != 0 {
+		t.Fatalf("EditMessageText calls = %d, want 0 (must not probe text-edit on a media message)", stubBot.editMessageTextCalls)
+	}
+	if stubBot.editMessageCaptionCalls != 1 {
+		t.Fatalf("EditMessageCaption calls = %d, want 1", stubBot.editMessageCaptionCalls)
+	}
+	params := stubBot.lastEditMessageCaptionParams
+	if params == nil {
+		t.Fatal("EditMessageCaption was not called")
+	}
+	if params.ChatID != h.chatID || params.MessageID != h.messageID {
+		t.Fatalf("EditMessageCaptionParams target = (chatID=%v, messageID=%v), want (%v, %v)", params.ChatID, params.MessageID, h.chatID, h.messageID)
+	}
+	if !strings.Contains(params.Caption, "new caption text") {
+		t.Fatalf("Caption = %q, want to contain %q", params.Caption, "new caption text")
+	}
+}
+
+func TestUpdateMessage_CaptionNotModifiedTreatedAsSuccess(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	stubBot.editMessageCaptionErr = errors.New("Bad Request: message is not modified")
+	p := &Platform{bot: stubBot}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2, isMedia: true}
+
+	if err := p.UpdateMessage(context.Background(), h, "same text"); err != nil {
+		t.Fatalf("UpdateMessage should treat 'not modified' as success, got: %v", err)
+	}
+}
+
+func TestUpdateMessage_CaptionHTMLParseFailFallsBackToPlainText(t *testing.T) {
+	stubBot := newStubTelegramBot()
+	stubBot.editMessageCaptionErrOnFirstCall = errors.New("Bad Request: can't parse entities")
+	p := &Platform{bot: stubBot}
+	h := &telegramPreviewHandle{chatID: 1, messageID: 2, isMedia: true}
+
+	if err := p.UpdateMessage(context.Background(), h, "hello world"); err != nil {
+		t.Fatalf("UpdateMessage: %v", err)
+	}
+	if stubBot.editMessageCaptionCalls != 2 {
+		t.Fatalf("EditMessageCaption calls = %d, want 2 (initial + plain-text retry)", stubBot.editMessageCaptionCalls)
+	}
+
+	last := stubBot.lastEditMessageCaptionParams
+	if last == nil {
+		t.Fatal("EditMessageCaption was not called")
+	}
+	if last.ParseMode != "" {
+		t.Fatalf("retry ParseMode = %q, want empty (plain text)", last.ParseMode)
+	}
+	if last.Caption != "hello world" {
+		t.Fatalf("retry Caption = %q, want raw plain text %q", last.Caption, "hello world")
+	}
 }

@@ -903,3 +903,46 @@ func TestStreamPreview_OverflowFollowUpCarriesFramePrefix(t *testing.T) {
 		t.Fatalf("follow-up body %q is not a suffix of %q (content altered)", sent[0], body)
 	}
 }
+
+// TestStreamPreview_AppendSeparatorNotRepeated is the regression test for the
+// blank-line pile-up in quiet mode. There, segmentStart never advances, so
+// every thinking/tool boundary for the rest of the turn calls appendSeparator.
+// A run of consecutive tool calls with no text in between must produce one
+// paragraph break, not one per call.
+func TestStreamPreview_AppendSeparatorNotRepeated(t *testing.T) {
+	mp := &mockUpdaterPlatform{}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 5000}
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+
+	sp.appendText("first segment")
+
+	// Ten tool boundaries in a row, no text in between.
+	added := 0
+	for i := 0; i < 10; i++ {
+		if sp.appendSeparator("\n\n") {
+			added++
+		}
+	}
+	if added != 1 {
+		t.Fatalf("appendSeparator added %d separators for 10 consecutive boundaries, want 1", added)
+	}
+
+	sp.mu.Lock()
+	got := sp.fullText
+	sp.mu.Unlock()
+	if got != "first segment\n\n" {
+		t.Fatalf("fullText = %q, want %q", got, "first segment\n\n")
+	}
+
+	// New text arrives, then another boundary: that one is meaningful again.
+	sp.appendText("second segment")
+	if !sp.appendSeparator("\n\n") {
+		t.Fatal("appendSeparator must add a break between two real text segments")
+	}
+	sp.mu.Lock()
+	got = sp.fullText
+	sp.mu.Unlock()
+	if got != "first segment\n\nsecond segment\n\n" {
+		t.Fatalf("fullText = %q, want %q", got, "first segment\n\nsecond segment\n\n")
+	}
+}

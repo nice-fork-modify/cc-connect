@@ -797,6 +797,14 @@ func (sp *streamPreview) appendSeparator(sep string) bool {
 	if sp.degraded || !sp.cfg.Enabled || sp.fullText == "" {
 		return false
 	}
+	// A separator only means anything between two pieces of text. In quiet mode
+	// segmentStart never advances, so every thinking/tool boundary for the rest
+	// of the turn reaches this function — a run of consecutive tool calls with
+	// no text in between would otherwise stack one blank line pair per call and
+	// fill the message with blank lines.
+	if strings.HasSuffix(sp.fullText, sep) {
+		return false
+	}
 	sp.fullText += sep
 	return true
 }
